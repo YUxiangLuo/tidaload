@@ -57,6 +57,7 @@ pub struct Track {
     pub artist: String,
     pub track_number: Option<u64>,
     pub volume_number: Option<u64>,
+    pub cover_uuid: Option<String>,
     pub allow_streaming: bool,
 }
 
@@ -652,12 +653,19 @@ fn album_from_value(value: &Value) -> Result<Album> {
         .or_else(|| nested_string(value, &["artist", "name"]))
         .unwrap_or_else(|| "Unknown Artist".to_string());
     let year = string_opt(value, "releaseDate").map(|date| date.chars().take(4).collect());
+    let album_cover_uuid = string_opt(value, "cover").filter(|cover| !cover.is_empty());
     let tracks = value
         .get("tracks")
         .and_then(Value::as_array)
         .unwrap_or(&Vec::new())
         .iter()
-        .map(track_from_value)
+        .map(|value| {
+            let mut track = track_from_value(value);
+            if track.cover_uuid.is_none() {
+                track.cover_uuid.clone_from(&album_cover_uuid);
+            }
+            track
+        })
         .collect();
 
     Ok(Album {
@@ -706,11 +714,19 @@ fn track_from_value(value: &Value) -> Track {
         artist,
         track_number: value.get("trackNumber").and_then(Value::as_u64),
         volume_number: value.get("volumeNumber").and_then(Value::as_u64),
+        cover_uuid: track_cover_uuid(value),
         allow_streaming: value
             .get("allowStreaming")
             .and_then(Value::as_bool)
             .unwrap_or(true),
     }
+}
+
+pub fn cover_image_url(cover_uuid: &str) -> String {
+    format!(
+        "https://resources.tidal.com/images/{}/1280x1280.jpg",
+        cover_uuid.replace('-', "/")
+    )
 }
 
 fn item_count(value: &Value) -> usize {
@@ -763,6 +779,12 @@ fn nested_string(value: &Value, keys: &[&str]) -> Option<String> {
         current = current.get(*key)?;
     }
     current.as_str().map(ToString::to_string)
+}
+
+fn track_cover_uuid(value: &Value) -> Option<String> {
+    nested_string(value, &["album", "cover"])
+        .or_else(|| string_opt(value, "cover"))
+        .filter(|cover| !cover.is_empty())
 }
 
 fn decode_constant(value: &str) -> Result<String> {
@@ -821,13 +843,47 @@ mod tests {
             "artist": {"name": "Artist"},
             "trackNumber": 7,
             "volumeNumber": 2,
+            "album": {"cover": "abcd-efgh"},
             "allowStreaming": true
         }));
 
         assert_eq!(track.id, "42");
         assert_eq!(track.track_number, Some(7));
         assert_eq!(track.volume_number, Some(2));
+        assert_eq!(track.cover_uuid.as_deref(), Some("abcd-efgh"));
         assert!(track.allow_streaming);
+    }
+
+    #[test]
+    fn album_tracks_fall_back_to_album_cover() {
+        let album = album_from_value(&serde_json::json!({
+            "id": 7,
+            "title": "Example Album",
+            "artist": {"name": "Artist"},
+            "cover": "12345678-abcd-efgh-ijkl-987654321000",
+            "numberOfVolumes": 1,
+            "tracks": [{
+                "id": 42,
+                "title": "Example",
+                "artist": {"name": "Artist"},
+                "trackNumber": 1,
+                "allowStreaming": true
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            album.tracks[0].cover_uuid.as_deref(),
+            Some("12345678-abcd-efgh-ijkl-987654321000")
+        );
+    }
+
+    #[test]
+    fn builds_tidal_cover_image_url() {
+        assert_eq!(
+            cover_image_url("12345678-abcd-efgh-ijkl-987654321000"),
+            "https://resources.tidal.com/images/12345678/abcd/efgh/ijkl/987654321000/1280x1280.jpg"
+        );
     }
 
     #[test]

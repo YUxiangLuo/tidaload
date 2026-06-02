@@ -34,6 +34,8 @@ cargo run -- download --concurrency 8 "https://tidal.com/browse/playlist/{playli
 Downloads are always saved under the current Linux user's Music folder.
 Before writing, tidaload deletes any existing track file or album/playlist folder
 with the same generated name. It does not keep a downloaded-state database.
+Each track file embeds the TIDAL album cover as MP4 artwork when cover metadata
+is available.
 
 Audio quality is fixed to lossless playback. tidaload first requests TIDAL's
 `HI_RES_LOSSLESS` FLAC/DASH manifest because the legacy `LOSSLESS` playback
