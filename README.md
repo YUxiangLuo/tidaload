@@ -7,28 +7,28 @@ A small Rust CLI for downloading TIDAL tracks, albums, and playlists.
 Log in first:
 
 ```sh
-cargo run -- login
+tidaload login
 ```
 
 Download a track, album, or playlist URL:
 
 ```sh
-cargo run -- download "https://tidal.com/browse/track/3083287"
-cargo run -- download "https://tidal.com/browse/album/147569387"
-cargo run -- download "https://tidal.com/browse/playlist/{playlist-id}"
+tidaload "https://tidal.com/browse/track/3083287"
+tidaload "https://tidal.com/browse/album/147569387"
+tidaload "https://tidal.com/browse/playlist/{playlist-id}"
 ```
 
 Raw IDs are supported when the resource kind is provided:
 
 ```sh
-cargo run -- download --kind track 3083287
-cargo run -- download --kind album 147569387
+tidaload --kind track 3083287
+tidaload --kind album 147569387
 ```
 
 Useful options:
 
 ```sh
-cargo run -- download --concurrency 8 "https://tidal.com/browse/playlist/{playlist-id}"
+tidaload --concurrency 8 "https://tidal.com/browse/playlist/{playlist-id}"
 ```
 
 By default, album and playlist downloads use at most 2 concurrent track

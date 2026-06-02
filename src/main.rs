@@ -42,6 +42,12 @@ struct Cli {
     #[arg(long, global = true, default_value_os_t = default_config_path())]
     config: PathBuf,
 
+    #[arg(long, global = true, value_enum)]
+    kind: Option<ResourceKind>,
+
+    #[arg(long, global = true)]
+    concurrency: Option<usize>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -52,13 +58,9 @@ enum Command {
     Download {
         #[arg(required = true)]
         items: Vec<String>,
-
-        #[arg(long, value_enum)]
-        kind: Option<ResourceKind>,
-
-        #[arg(long)]
-        concurrency: Option<usize>,
     },
+    #[command(external_subcommand)]
+    Direct(Vec<String>),
 }
 
 #[tokio::main]
@@ -74,37 +76,45 @@ async fn main() -> Result<()> {
             config.save(&cli.config)?;
             println!("Saved TIDAL credentials to {}", cli.config.display());
         }
-        Command::Download {
-            items,
-            kind,
-            concurrency,
-        } => {
-            if let Some(concurrency) = concurrency {
-                config.downloads.concurrency = concurrency.max(1);
-            } else {
-                config.downloads.concurrency = config
-                    .downloads
-                    .concurrency
-                    .clamp(1, DEFAULT_DOWNLOAD_CONCURRENCY);
-            }
-
-            let mut client = TidalClient::new(config.tidal.clone())?;
-            let changed = client.ensure_login().await?;
-            if changed {
-                config.tidal = client.config.clone();
-                config.save(&cli.config)?;
-            }
-
-            let resources = items
-                .iter()
-                .map(|item| parse_resource(item, kind))
-                .collect::<Result<Vec<_>>>()?;
-            let download_root = music_download_dir()?;
-
-            for resource in resources {
-                download_resource(&client, &config, resource, &download_root).await?;
-            }
+        Command::Download { items } | Command::Direct(items) => {
+            run_download(&mut config, &cli.config, cli.kind, cli.concurrency, items).await?;
         }
+    }
+
+    Ok(())
+}
+
+async fn run_download(
+    config: &mut Config,
+    config_path: &Path,
+    kind: Option<ResourceKind>,
+    concurrency: Option<usize>,
+    items: Vec<String>,
+) -> Result<()> {
+    if let Some(concurrency) = concurrency {
+        config.downloads.concurrency = concurrency.max(1);
+    } else {
+        config.downloads.concurrency = config
+            .downloads
+            .concurrency
+            .clamp(1, DEFAULT_DOWNLOAD_CONCURRENCY);
+    }
+
+    let mut client = TidalClient::new(config.tidal.clone())?;
+    let changed = client.ensure_login().await?;
+    if changed {
+        config.tidal = client.config.clone();
+        config.save(config_path)?;
+    }
+
+    let resources = items
+        .iter()
+        .map(|item| parse_resource(item, kind))
+        .collect::<Result<Vec<_>>>()?;
+    let download_root = music_download_dir()?;
+
+    for resource in resources {
+        download_resource(&client, config, resource, &download_root).await?;
     }
 
     Ok(())
@@ -565,5 +575,60 @@ mod tests {
         assert!(should_log_dash_segment_progress(8, 32));
         assert!(should_log_dash_segment_progress(32, 32));
         assert!(!should_log_dash_segment_progress(7, 32));
+    }
+
+    #[test]
+    fn parses_direct_download_url() {
+        let cli = Cli::try_parse_from(["tidaload", "https://tidal.com/track/526687566/u"]).unwrap();
+
+        match cli.command {
+            Command::Direct(items) => {
+                assert_eq!(items, vec!["https://tidal.com/track/526687566/u"]);
+            }
+            command => panic!("expected direct download command, got {command:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_direct_raw_id_with_global_kind() {
+        let cli = Cli::try_parse_from(["tidaload", "--kind", "track", "526687566"]).unwrap();
+
+        assert!(matches!(cli.kind, Some(ResourceKind::Track)));
+        match cli.command {
+            Command::Direct(items) => assert_eq!(items, vec!["526687566"]),
+            command => panic!("expected direct download command, got {command:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_direct_download_with_global_concurrency() {
+        let cli = Cli::try_parse_from([
+            "tidaload",
+            "--concurrency",
+            "8",
+            "https://tidal.com/playlist/36ea71a8-445e-41a4-82ab-6628c581535d",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.concurrency, Some(8));
+        match cli.command {
+            Command::Direct(items) => assert_eq!(
+                items,
+                vec!["https://tidal.com/playlist/36ea71a8-445e-41a4-82ab-6628c581535d"]
+            ),
+            command => panic!("expected direct download command, got {command:?}"),
+        }
+    }
+
+    #[test]
+    fn keeps_legacy_download_subcommand() {
+        let cli =
+            Cli::try_parse_from(["tidaload", "download", "--kind", "track", "526687566"]).unwrap();
+
+        assert!(matches!(cli.kind, Some(ResourceKind::Track)));
+        match cli.command {
+            Command::Download { items } => assert_eq!(items, vec!["526687566"]),
+            command => panic!("expected legacy download command, got {command:?}"),
+        }
     }
 }
