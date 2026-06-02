@@ -5,6 +5,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use reqwest::StatusCode;
+use roxmltree::{Document, Node};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::time::{Duration, sleep};
@@ -467,10 +468,10 @@ fn tidal_client_builder() -> Result<reqwest::ClientBuilder> {
 
 pub fn parse_resource(input: &str, fallback_kind: Option<ResourceKind>) -> Result<ParsedResource> {
     if let Ok(url) = url::Url::parse(input) {
-        if let Some(host) = url.host_str() {
-            if !host.ends_with("tidal.com") {
-                bail!("not a TIDAL URL: {input}");
-            }
+        if let Some(host) = url.host_str()
+            && !host.ends_with("tidal.com")
+        {
+            bail!("not a TIDAL URL: {input}");
         }
 
         let parts: Vec<&str> = url.path_segments().map(|s| s.collect()).unwrap_or_default();
@@ -556,68 +557,84 @@ fn parse_manifest(manifest: &str) -> Result<DownloadInfo> {
 }
 
 fn parse_dash_manifest(manifest: &str) -> Result<DownloadInfo> {
-    let representation = first_xml_tag(manifest, "Representation")
-        .ok_or_else(|| anyhow!("TIDAL DASH manifest missing Representation"))?;
-    let codecs = xml_attr(representation, "codecs")
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if codecs != "flac" {
-        bail!("unsupported TIDAL DASH codec: {codecs}");
-    }
-
-    let template = first_xml_tag(manifest, "SegmentTemplate")
+    let document = Document::parse(manifest).context("failed to parse TIDAL DASH manifest XML")?;
+    let representation = flac_representation(&document)?;
+    let template = segment_template_for(representation)
         .ok_or_else(|| anyhow!("TIDAL DASH manifest missing SegmentTemplate"))?;
-    let initialization_url = xml_attr(template, "initialization")
+    let initialization_url = template
+        .attribute("initialization")
         .ok_or_else(|| anyhow!("TIDAL DASH manifest missing initialization URL"))?;
-    let media_url_template = xml_attr(template, "media")
+    let media_url_template = template
+        .attribute("media")
         .ok_or_else(|| anyhow!("TIDAL DASH manifest missing media URL template"))?;
-    let start_number = xml_attr(template, "startNumber")
+    let start_number = template
+        .attribute("startNumber")
         .and_then(|value| value.parse::<u32>().ok())
         .unwrap_or(1);
-    let segment_count = count_dash_segments(manifest)?;
+    let segment_count = count_dash_segments(template)?;
 
     Ok(DownloadInfo::Segmented {
-        initialization_url,
-        media_url_template,
+        initialization_url: initialization_url.to_string(),
+        media_url_template: media_url_template.to_string(),
         start_number,
         segment_count,
         extension: "m4a".to_string(),
     })
 }
 
-fn first_xml_tag<'a>(xml: &'a str, tag_name: &str) -> Option<&'a str> {
-    let start = xml.find(&format!("<{tag_name}"))?;
-    let end = xml[start..].find('>')? + start + 1;
-    Some(&xml[start..end])
+fn flac_representation<'a, 'input>(document: &'a Document<'input>) -> Result<Node<'a, 'input>> {
+    let mut saw_representation = false;
+    let mut unsupported_codecs = Vec::new();
+
+    for representation in document
+        .descendants()
+        .filter(|node| xml_tag_name(*node, "Representation"))
+    {
+        saw_representation = true;
+        let codecs = representation
+            .attribute("codecs")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if codecs == "flac" {
+            return Ok(representation);
+        }
+        unsupported_codecs.push(codecs);
+    }
+
+    if !saw_representation {
+        bail!("TIDAL DASH manifest missing Representation");
+    }
+
+    let codecs = unsupported_codecs
+        .into_iter()
+        .filter(|codecs| !codecs.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!("unsupported TIDAL DASH codec: {codecs}");
 }
 
-fn xml_attr(tag: &str, attr_name: &str) -> Option<String> {
-    let needle = format!("{attr_name}=\"");
-    let start = tag.find(&needle)? + needle.len();
-    let end = tag[start..].find('"')? + start;
-    Some(xml_unescape(&tag[start..end]))
+fn segment_template_for<'a, 'input>(representation: Node<'a, 'input>) -> Option<Node<'a, 'input>> {
+    representation
+        .descendants()
+        .find(|node| xml_tag_name(*node, "SegmentTemplate"))
+        .or_else(|| {
+            representation.ancestors().find_map(|ancestor| {
+                ancestor
+                    .children()
+                    .find(|node| xml_tag_name(*node, "SegmentTemplate"))
+            })
+        })
 }
 
-fn xml_unescape(value: &str) -> String {
-    value
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-}
-
-fn count_dash_segments(manifest: &str) -> Result<u32> {
+fn count_dash_segments(template: Node<'_, '_>) -> Result<u32> {
     let mut count = 0u32;
-    let mut rest = manifest;
 
-    while let Some(offset) = rest.find("<S ") {
-        rest = &rest[offset..];
-        let Some(end) = rest.find('>') else {
-            bail!("TIDAL DASH manifest has an unterminated segment timeline entry");
-        };
-        let tag = &rest[..=end];
-        let repeat = xml_attr(tag, "r")
+    for segment in template
+        .descendants()
+        .filter(|node| xml_tag_name(*node, "S"))
+    {
+        let repeat = segment
+            .attribute("r")
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
         if repeat < 0 {
@@ -626,7 +643,6 @@ fn count_dash_segments(manifest: &str) -> Result<u32> {
         count = count
             .checked_add(repeat as u32 + 1)
             .ok_or_else(|| anyhow!("TIDAL DASH manifest has too many segments"))?;
-        rest = &rest[end + 1..];
     }
 
     if count == 0 {
@@ -634,6 +650,10 @@ fn count_dash_segments(manifest: &str) -> Result<u32> {
     }
 
     Ok(count)
+}
+
+fn xml_tag_name(node: Node<'_, '_>, name: &str) -> bool {
+    node.is_element() && node.tag_name().name() == name
 }
 
 fn restriction_error(value: &Value) -> anyhow::Error {
@@ -935,6 +955,53 @@ mod tests {
                 );
                 assert_eq!(start_number, 3);
                 assert_eq!(segment_count, 4);
+                assert_eq!(extension, "m4a");
+            }
+            DownloadInfo::Direct { .. } => panic!("expected segmented download info"),
+        }
+    }
+
+    #[test]
+    fn parses_dash_manifest_with_shared_template_and_single_quoted_attributes() {
+        let xml = r#"
+            <MPD xmlns='urn:mpeg:dash:schema:mpd:2011'>
+              <Period>
+                <AdaptationSet>
+                  <SegmentTemplate
+                    initialization='https://audio.example/init.mp4?token=a&amp;b=1'
+                    media='https://audio.example/$Number$.mp4?token=a&amp;b=1'
+                    startNumber='7'>
+                    <SegmentTimeline>
+                      <S d='100' r='1'/>
+                    </SegmentTimeline>
+                  </SegmentTemplate>
+                  <Representation id='aac' codecs='mp4a.40.2'/>
+                  <Representation id='flac' codecs='flac'/>
+                </AdaptationSet>
+              </Period>
+            </MPD>
+        "#;
+        let encoded = STANDARD.encode(xml);
+
+        let info = parse_manifest(&encoded).unwrap();
+        match info {
+            DownloadInfo::Segmented {
+                initialization_url,
+                media_url_template,
+                start_number,
+                segment_count,
+                extension,
+            } => {
+                assert_eq!(
+                    initialization_url,
+                    "https://audio.example/init.mp4?token=a&b=1"
+                );
+                assert_eq!(
+                    media_url_template,
+                    "https://audio.example/$Number$.mp4?token=a&b=1"
+                );
+                assert_eq!(start_number, 7);
+                assert_eq!(segment_count, 2);
                 assert_eq!(extension, "m4a");
             }
             DownloadInfo::Direct { .. } => panic!("expected segmented download info"),
