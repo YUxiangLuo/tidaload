@@ -19,7 +19,6 @@ pub struct TidalConfig {
     pub access_token: String,
     pub refresh_token: String,
     pub token_expiry: f64,
-    pub quality: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,7 +44,6 @@ impl Default for TidalConfig {
             access_token: String::new(),
             refresh_token: String::new(),
             token_expiry: 0.0,
-            quality: 3,
         }
     }
 }

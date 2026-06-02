@@ -28,7 +28,6 @@ cargo run -- download --kind album 147569387
 Useful options:
 
 ```sh
-cargo run -- download -q 2 "https://tidal.com/browse/album/147569387"
 cargo run -- download --concurrency 8 "https://tidal.com/browse/playlist/{playlist-id}"
 ```
 
@@ -36,11 +35,14 @@ Downloads are always saved under the current Linux user's Music folder.
 Before writing, tidaload deletes any existing track file or album/playlist folder
 with the same generated name. It does not keep a downloaded-state database.
 
-Quality values:
+Audio quality is fixed to lossless playback. tidaload first requests TIDAL's
+`HI_RES_LOSSLESS` FLAC/DASH manifest because the legacy `LOSSLESS` playback
+endpoint can be downgraded by TIDAL to AAC `HIGH`; if FLAC/DASH is unavailable,
+it falls back to `LOSSLESS`. DASH audio is saved as an `.m4a` fragmented MP4
+container with a FLAC audio stream.
 
-- `0`: LOW
-- `1`: HIGH
-- `2`: LOSSLESS
-- `3`: HI_RES
+DNS resolution is handled through DNS-over-HTTPS using `dns.google`, with a short
+in-process cache. This avoids relying on the local Linux resolver for TIDAL API
+and audio CDN hosts.
 
 The default config file is `~/.config/tidaload/config.toml`.

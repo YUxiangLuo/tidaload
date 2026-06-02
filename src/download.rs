@@ -25,27 +25,11 @@ pub async fn download_to_file(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    let response = client
-        .get(url)
-        .send()
-        .await
-        .with_context(|| format!("failed to request {url}"))?
-        .error_for_status()
-        .with_context(|| format!("download request failed for {url}"))?;
-
     let tmp_path = path.with_extension("tidaload.part");
     let mut output = fs::File::create(&tmp_path)
         .await
         .with_context(|| format!("failed to create {}", tmp_path.display()))?;
-    let mut stream = response.bytes_stream();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("failed while reading download stream")?;
-        output
-            .write_all(&chunk)
-            .await
-            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-    }
+    append_url(client, url, &tmp_path, &mut output).await?;
     output.flush().await?;
     drop(output);
 
@@ -58,6 +42,43 @@ pub async fn download_to_file(
             .await
             .with_context(|| format!("failed to write {}", tmp_path.display()))?;
     }
+
+    fs::rename(&tmp_path, path).await.with_context(|| {
+        format!(
+            "failed to move {} to {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })
+}
+
+pub async fn download_segmented_to_file(
+    client: &reqwest::Client,
+    initialization_url: &str,
+    media_url_template: &str,
+    start_number: u32,
+    segment_count: u32,
+    path: &Path,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+
+    let tmp_path = path.with_extension("tidaload.part");
+    let mut output = fs::File::create(&tmp_path)
+        .await
+        .with_context(|| format!("failed to create {}", tmp_path.display()))?;
+
+    append_url(client, initialization_url, &tmp_path, &mut output).await?;
+    for number in start_number..start_number + segment_count {
+        let segment_url = media_url_template.replace("$Number$", &number.to_string());
+        append_url(client, &segment_url, &tmp_path, &mut output).await?;
+    }
+
+    output.flush().await?;
+    drop(output);
 
     fs::rename(&tmp_path, path).await.with_context(|| {
         format!(
@@ -81,6 +102,32 @@ pub async fn remove_existing_path(path: &Path) -> Result<()> {
             Err(err).with_context(|| format!("failed to inspect existing path {}", path.display()))
         }
     }
+}
+
+async fn append_url(
+    client: &reqwest::Client,
+    url: &str,
+    tmp_path: &Path,
+    output: &mut fs::File,
+) -> Result<()> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("failed to request {url}"))?
+        .error_for_status()
+        .with_context(|| format!("download request failed for {url}"))?;
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("failed while reading download stream")?;
+        output
+            .write_all(&chunk)
+            .await
+            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    }
+
+    Ok(())
 }
 
 fn decrypt_tidal_file(data: &[u8], encryption_key: &str) -> Result<Vec<u8>> {

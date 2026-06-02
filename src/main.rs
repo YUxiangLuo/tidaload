@@ -2,21 +2,24 @@
 compile_error!("tidaload currently supports Linux only");
 
 mod config;
+mod doh;
 mod download;
 mod tidal;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::stream::{self, StreamExt};
 use tokio::sync::Semaphore;
 
 use crate::config::{Config, default_config_path, music_download_dir};
-use crate::download::{download_to_file, remove_existing_path, sanitize_file_name};
+use crate::download::{
+    download_segmented_to_file, download_to_file, remove_existing_path, sanitize_file_name,
+};
 use crate::tidal::{
-    Album, ParsedResource, Playlist, ResourceKind, TidalClient, Track, parse_resource,
+    Album, DownloadInfo, ParsedResource, Playlist, ResourceKind, TidalClient, Track, parse_resource,
 };
 
 #[derive(Debug, Parser)]
@@ -40,9 +43,6 @@ enum Command {
         #[arg(long, value_enum)]
         kind: Option<ResourceKind>,
 
-        #[arg(short, long)]
-        quality: Option<u8>,
-
         #[arg(long)]
         concurrency: Option<usize>,
     },
@@ -64,12 +64,8 @@ async fn main() -> Result<()> {
         Command::Download {
             items,
             kind,
-            quality,
             concurrency,
         } => {
-            if let Some(quality) = quality {
-                config.tidal.quality = quality.min(3);
-            }
             if let Some(concurrency) = concurrency {
                 config.downloads.concurrency = concurrency.max(1);
             }
@@ -105,7 +101,7 @@ async fn download_resource(
     match resource.kind {
         ResourceKind::Track => {
             let track = client.get_track(&resource.id).await?;
-            download_track(client, config, track, download_root, None).await?;
+            download_single_track(client, track, download_root).await?;
         }
         ResourceKind::Album => {
             let album = client.get_album(&resource.id).await?;
@@ -126,11 +122,13 @@ async fn download_album(
     download_root: &Path,
 ) -> Result<()> {
     println!(
-        "Downloading album: {} - {} [{}] ({} tracks)",
+        "Downloading album: {} - {} [{}] ({} tracks, {} disc{})",
         album.artist,
         album.title,
         album.id,
-        album.tracks.len()
+        album.tracks.len(),
+        album.disc_total,
+        if album.disc_total == 1 { "" } else { "s" }
     );
 
     let year = album.year.as_deref().unwrap_or("Unknown Year");
@@ -138,8 +136,18 @@ async fn download_album(
         "{} - {} ({})",
         album.artist, album.title, year
     )));
+    let disc_subdirectories = album.disc_total > 1;
     remove_existing_path(&folder).await?;
-    download_tracks_concurrently(client, config, album.tracks, folder, true).await
+    download_tracks_concurrently(
+        client,
+        config,
+        album.tracks,
+        folder,
+        TrackNumbering::Album {
+            disc_subdirectories,
+        },
+    )
+    .await
 }
 
 async fn download_playlist(
@@ -157,7 +165,20 @@ async fn download_playlist(
 
     let folder = download_root.join(sanitize_file_name(&playlist.title));
     remove_existing_path(&folder).await?;
-    download_tracks_concurrently(client, config, playlist.tracks, folder, true).await
+    download_tracks_concurrently(
+        client,
+        config,
+        playlist.tracks,
+        folder,
+        TrackNumbering::Playlist,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TrackNumbering {
+    Album { disc_subdirectories: bool },
+    Playlist,
 }
 
 async fn download_tracks_concurrently(
@@ -165,39 +186,65 @@ async fn download_tracks_concurrently(
     config: &Config,
     tracks: Vec<Track>,
     folder: PathBuf,
-    include_track_number: bool,
+    numbering: TrackNumbering,
 ) -> Result<()> {
     let semaphore = Arc::new(Semaphore::new(config.downloads.concurrency.max(1)));
 
-    stream::iter(tracks.into_iter().enumerate())
+    let results: Vec<Result<()>> = stream::iter(tracks.into_iter().enumerate())
         .map(|(index, track)| {
             let semaphore = Arc::clone(&semaphore);
             let folder = folder.clone();
             async move {
                 let _permit = semaphore.acquire_owned().await?;
-                download_track(client, config, track, &folder, Some(index + 1)).await
+                let playlist_position = match numbering {
+                    TrackNumbering::Playlist => Some(index + 1),
+                    TrackNumbering::Album { .. } => None,
+                };
+                let disc_subdirectories = match numbering {
+                    TrackNumbering::Album {
+                        disc_subdirectories,
+                    } => disc_subdirectories,
+                    TrackNumbering::Playlist => false,
+                };
+                download_track(
+                    client,
+                    track,
+                    &folder,
+                    playlist_position,
+                    disc_subdirectories,
+                )
+                .await
             }
         })
         .buffer_unordered(config.downloads.concurrency.max(1))
-        .for_each(|result| async {
-            if let Err(err) = result {
-                eprintln!("download failed: {err:#}");
-            }
-        })
+        .collect()
         .await;
 
-    if !include_track_number {
-        println!("Downloaded tracks to {}", folder.display());
+    let mut failures = 0;
+    for result in results {
+        if let Err(err) = result {
+            failures += 1;
+            eprintln!("download failed: {err:#}");
+        }
     }
+
+    if failures > 0 {
+        bail!("{failures} track download(s) failed");
+    }
+
     Ok(())
+}
+
+async fn download_single_track(client: &TidalClient, track: Track, folder: &Path) -> Result<()> {
+    download_track(client, track, folder, None, false).await
 }
 
 async fn download_track(
     client: &TidalClient,
-    config: &Config,
     track: Track,
     folder: &Path,
     playlist_position: Option<usize>,
+    disc_subdirectories: bool,
 ) -> Result<()> {
     if !track.allow_streaming {
         println!("Skipping unavailable track {} ({})", track.title, track.id);
@@ -205,22 +252,44 @@ async fn download_track(
     }
 
     let info = client
-        .get_download_info(&track.id, config.tidal.quality)
+        .get_download_info(&track.id)
         .await
         .with_context(|| format!("failed to get playback info for {}", track.id))?;
 
-    let filename = track_filename(&track, &info.extension, playlist_position);
-    let path = folder.join(filename);
+    let filename = track_filename(&track, info.extension(), playlist_position);
+    let target_folder = if disc_subdirectories {
+        folder.join(format!("Disc {}", track.volume_number.unwrap_or(1)))
+    } else {
+        folder.to_path_buf()
+    };
+    let path = target_folder.join(filename);
     remove_existing_path(&path).await?;
 
     println!("Downloading: {} - {}", track.artist, track.title);
-    download_to_file(
-        client.http_client(),
-        &info.url,
-        &path,
-        info.encryption_key.as_deref(),
-    )
-    .await
+    match &info {
+        DownloadInfo::Direct {
+            url,
+            encryption_key,
+            ..
+        } => download_to_file(client.http_client(), url, &path, encryption_key.as_deref()).await,
+        DownloadInfo::Segmented {
+            initialization_url,
+            media_url_template,
+            start_number,
+            segment_count,
+            ..
+        } => {
+            download_segmented_to_file(
+                client.http_client(),
+                initialization_url,
+                media_url_template,
+                *start_number,
+                *segment_count,
+                &path,
+            )
+            .await
+        }
+    }
     .with_context(|| format!("failed to download {}", track.id))?;
     println!("Saved: {}", path.display());
     Ok(())

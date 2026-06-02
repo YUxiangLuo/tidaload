@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -10,6 +10,7 @@ use serde_json::Value;
 use tokio::time::{Duration, sleep};
 
 use crate::config::TidalConfig;
+use crate::doh::DohResolver;
 
 const BASE: &str = "https://api.tidalhifi.com/v1";
 const SESSION_URL: &str = "https://api.tidal.com/v1/sessions";
@@ -38,6 +39,7 @@ pub struct Album {
     pub title: String,
     pub artist: String,
     pub year: Option<String>,
+    pub disc_total: u64,
     pub tracks: Vec<Track>,
 }
 
@@ -54,14 +56,32 @@ pub struct Track {
     pub title: String,
     pub artist: String,
     pub track_number: Option<u64>,
+    pub volume_number: Option<u64>,
     pub allow_streaming: bool,
 }
 
 #[derive(Debug, Clone)]
-pub struct DownloadInfo {
-    pub url: String,
-    pub extension: String,
-    pub encryption_key: Option<String>,
+pub enum DownloadInfo {
+    Direct {
+        url: String,
+        extension: String,
+        encryption_key: Option<String>,
+    },
+    Segmented {
+        initialization_url: String,
+        media_url_template: String,
+        start_number: u32,
+        segment_count: u32,
+        extension: String,
+    },
+}
+
+impl DownloadInfo {
+    pub fn extension(&self) -> &str {
+        match self {
+            Self::Direct { extension, .. } | Self::Segmented { extension, .. } => extension,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,7 +119,7 @@ impl TidalClient {
     pub fn new(config: TidalConfig) -> Result<Self> {
         let client_id = decode_constant(CLIENT_ID_B64)?;
         let client_secret = decode_constant(CLIENT_SECRET_B64)?;
-        let client = tidal_client_builder()
+        let client = tidal_client_builder()?
             .build()
             .context("failed to build HTTP client")?;
 
@@ -181,47 +201,41 @@ impl TidalClient {
         playlist_from_value(&playlist)
     }
 
-    pub async fn get_download_info(&self, track_id: &str, quality: u8) -> Result<DownloadInfo> {
-        let mut target_quality = quality.min(3);
-
-        loop {
-            let audio_quality = match target_quality {
-                0 => "LOW",
-                1 => "HIGH",
-                2 => "LOSSLESS",
-                _ => "HI_RES",
-            };
-
-            let resp = self
-                .api_get(
-                    &format!("tracks/{track_id}/playbackinfopostpaywall"),
-                    &[
-                        ("audioquality", audio_quality.to_string()),
-                        ("playbackmode", "STREAM".to_string()),
-                        ("assetpresentation", "FULL".to_string()),
-                    ],
-                )
-                .await?;
-
-            let Some(manifest) = resp.get("manifest").and_then(Value::as_str) else {
-                let message = resp
-                    .get("userMessage")
-                    .and_then(Value::as_str)
-                    .unwrap_or("TIDAL did not return a playback manifest");
-                bail!("{message}");
-            };
-
-            match parse_manifest(manifest) {
-                Ok(info) => return Ok(info),
-                Err(err) if target_quality > 0 => {
-                    eprintln!(
-                        "failed to parse manifest at quality {target_quality}: {err}; retrying lower quality"
-                    );
-                    target_quality -= 1;
-                }
-                Err(err) => return Err(err),
-            }
+    pub async fn get_download_info(&self, track_id: &str) -> Result<DownloadInfo> {
+        match self.request_download_info(track_id, "HI_RES_LOSSLESS").await {
+            Ok(info) => Ok(info),
+            Err(hi_res_error) => self
+                .request_download_info(track_id, "LOSSLESS")
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to get HI_RES_LOSSLESS playback info; fallback LOSSLESS also failed; HI_RES_LOSSLESS error: {hi_res_error:#}"
+                    )
+                }),
         }
+    }
+
+    async fn request_download_info(&self, track_id: &str, quality: &str) -> Result<DownloadInfo> {
+        let resp = self
+            .api_get(
+                &format!("tracks/{track_id}/playbackinfopostpaywall"),
+                &[
+                    ("audioquality", quality.to_string()),
+                    ("playbackmode", "STREAM".to_string()),
+                    ("assetpresentation", "FULL".to_string()),
+                ],
+            )
+            .await?;
+
+        let Some(manifest) = resp.get("manifest").and_then(Value::as_str) else {
+            let message = resp
+                .get("userMessage")
+                .and_then(Value::as_str)
+                .unwrap_or("TIDAL did not return a playback manifest");
+            bail!("{message}");
+        };
+
+        parse_manifest(manifest)
     }
 
     async fn get_all_items(
@@ -440,26 +454,14 @@ impl TidalClient {
     }
 }
 
-fn tidal_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+fn tidal_client_builder() -> Result<reqwest::ClientBuilder> {
+    let doh_resolver = DohResolver::new()?;
+
+    Ok(reqwest::Client::builder()
         .user_agent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:83.0) Gecko/20100101 Firefox/83.0",
         )
-        // In this workspace, the native resolver intermittently returns no addresses
-        // for TIDAL CloudFront hosts even when direct HTTPS access works. These mappings
-        // preserve the original hostname for TLS/SNI and only bypass DNS.
-        .resolve(
-            "auth.tidal.com",
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(3, 169, 173, 64)), 443),
-        )
-        .resolve(
-            "api.tidalhifi.com",
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(3, 169, 173, 102)), 443),
-        )
-        .resolve(
-            "api.tidal.com",
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(3, 169, 173, 10)), 443),
-        )
+        .dns_resolver(Arc::new(doh_resolver)))
 }
 
 pub fn parse_resource(input: &str, fallback_kind: Option<ResourceKind>) -> Result<ParsedResource> {
@@ -506,8 +508,12 @@ fn parse_manifest(manifest: &str) -> Result<DownloadInfo> {
     let decoded = STANDARD
         .decode(manifest)
         .context("failed to base64-decode TIDAL manifest")?;
-    let value: Value =
-        serde_json::from_slice(&decoded).context("failed to parse TIDAL manifest")?;
+    let decoded = std::str::from_utf8(&decoded).context("TIDAL manifest is not valid UTF-8")?;
+    if decoded.trim_start().starts_with('<') {
+        return parse_dash_manifest(decoded);
+    }
+
+    let value: Value = serde_json::from_str(decoded).context("failed to parse TIDAL manifest")?;
 
     let url = value
         .get("urls")
@@ -541,11 +547,92 @@ fn parse_manifest(manifest: &str) -> Result<DownloadInfo> {
             .map(ToString::to_string)
     };
 
-    Ok(DownloadInfo {
+    Ok(DownloadInfo::Direct {
         url: url.to_string(),
         extension: extension.to_string(),
         encryption_key,
     })
+}
+
+fn parse_dash_manifest(manifest: &str) -> Result<DownloadInfo> {
+    let representation = first_xml_tag(manifest, "Representation")
+        .ok_or_else(|| anyhow!("TIDAL DASH manifest missing Representation"))?;
+    let codecs = xml_attr(representation, "codecs")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if codecs != "flac" {
+        bail!("unsupported TIDAL DASH codec: {codecs}");
+    }
+
+    let template = first_xml_tag(manifest, "SegmentTemplate")
+        .ok_or_else(|| anyhow!("TIDAL DASH manifest missing SegmentTemplate"))?;
+    let initialization_url = xml_attr(template, "initialization")
+        .ok_or_else(|| anyhow!("TIDAL DASH manifest missing initialization URL"))?;
+    let media_url_template = xml_attr(template, "media")
+        .ok_or_else(|| anyhow!("TIDAL DASH manifest missing media URL template"))?;
+    let start_number = xml_attr(template, "startNumber")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1);
+    let segment_count = count_dash_segments(manifest)?;
+
+    Ok(DownloadInfo::Segmented {
+        initialization_url,
+        media_url_template,
+        start_number,
+        segment_count,
+        extension: "m4a".to_string(),
+    })
+}
+
+fn first_xml_tag<'a>(xml: &'a str, tag_name: &str) -> Option<&'a str> {
+    let start = xml.find(&format!("<{tag_name}"))?;
+    let end = xml[start..].find('>')? + start + 1;
+    Some(&xml[start..end])
+}
+
+fn xml_attr(tag: &str, attr_name: &str) -> Option<String> {
+    let needle = format!("{attr_name}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')? + start;
+    Some(xml_unescape(&tag[start..end]))
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+}
+
+fn count_dash_segments(manifest: &str) -> Result<u32> {
+    let mut count = 0u32;
+    let mut rest = manifest;
+
+    while let Some(offset) = rest.find("<S ") {
+        rest = &rest[offset..];
+        let Some(end) = rest.find('>') else {
+            bail!("TIDAL DASH manifest has an unterminated segment timeline entry");
+        };
+        let tag = &rest[..=end];
+        let repeat = xml_attr(tag, "r")
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if repeat < 0 {
+            bail!("unsupported open-ended TIDAL DASH segment repeat");
+        }
+        count = count
+            .checked_add(repeat as u32 + 1)
+            .ok_or_else(|| anyhow!("TIDAL DASH manifest has too many segments"))?;
+        rest = &rest[end + 1..];
+    }
+
+    if count == 0 {
+        bail!("TIDAL DASH manifest has no media segments");
+    }
+
+    Ok(count)
 }
 
 fn restriction_error(value: &Value) -> anyhow::Error {
@@ -578,6 +665,10 @@ fn album_from_value(value: &Value) -> Result<Album> {
         title,
         artist,
         year,
+        disc_total: value
+            .get("numberOfVolumes")
+            .and_then(Value::as_u64)
+            .unwrap_or(1),
         tracks,
     })
 }
@@ -614,6 +705,7 @@ fn track_from_value(value: &Value) -> Track {
         title,
         artist,
         track_number: value.get("trackNumber").and_then(Value::as_u64),
+        volume_number: value.get("volumeNumber").and_then(Value::as_u64),
         allow_streaming: value
             .get("allowStreaming")
             .and_then(Value::as_bool)
@@ -701,5 +793,77 @@ mod tests {
         let parsed = parse_resource("https://tidal.com/browse/album/147569387", None).unwrap();
         assert!(matches!(parsed.kind, ResourceKind::Album));
         assert_eq!(parsed.id, "147569387");
+    }
+
+    #[test]
+    fn parses_tidal_album_url_with_slug() {
+        let parsed = parse_resource("https://tidal.com/album/524851236/u", None).unwrap();
+        assert!(matches!(parsed.kind, ResourceKind::Album));
+        assert_eq!(parsed.id, "524851236");
+    }
+
+    #[test]
+    fn builds_track_metadata_for_album_downloads() {
+        let track = track_from_value(&serde_json::json!({
+            "id": 42,
+            "title": "Example",
+            "artist": {"name": "Artist"},
+            "trackNumber": 7,
+            "volumeNumber": 2,
+            "allowStreaming": true
+        }));
+
+        assert_eq!(track.id, "42");
+        assert_eq!(track.track_number, Some(7));
+        assert_eq!(track.volume_number, Some(2));
+        assert!(track.allow_streaming);
+    }
+
+    #[test]
+    fn parses_flac_dash_manifest() {
+        let xml = r#"
+            <MPD>
+              <Period>
+                <AdaptationSet>
+                  <Representation codecs="flac">
+                    <SegmentTemplate
+                      initialization="https://audio.example/init.mp4?token=a&amp;b=1"
+                      media="https://audio.example/$Number$.mp4?token=a&amp;b=1"
+                      startNumber="3">
+                      <SegmentTimeline>
+                        <S d="100" r="2"/>
+                        <S d="50"/>
+                      </SegmentTimeline>
+                    </SegmentTemplate>
+                  </Representation>
+                </AdaptationSet>
+              </Period>
+            </MPD>
+        "#;
+        let encoded = STANDARD.encode(xml);
+
+        let info = parse_manifest(&encoded).unwrap();
+        match info {
+            DownloadInfo::Segmented {
+                initialization_url,
+                media_url_template,
+                start_number,
+                segment_count,
+                extension,
+            } => {
+                assert_eq!(
+                    initialization_url,
+                    "https://audio.example/init.mp4?token=a&b=1"
+                );
+                assert_eq!(
+                    media_url_template,
+                    "https://audio.example/$Number$.mp4?token=a&b=1"
+                );
+                assert_eq!(start_number, 3);
+                assert_eq!(segment_count, 4);
+                assert_eq!(extension, "m4a");
+            }
+            DownloadInfo::Direct { .. } => panic!("expected segmented download info"),
+        }
     }
 }
