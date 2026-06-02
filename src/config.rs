@@ -1,12 +1,15 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 2;
+pub const DEFAULT_DASH_SEGMENT_CONCURRENCY: usize = 8;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub tidal: TidalConfig,
@@ -27,15 +30,7 @@ pub struct TidalConfig {
 #[serde(default)]
 pub struct DownloadsConfig {
     pub concurrency: usize,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            tidal: TidalConfig::default(),
-            downloads: DownloadsConfig::default(),
-        }
-    }
+    pub dash_segment_concurrency: usize,
 }
 
 impl Default for TidalConfig {
@@ -54,6 +49,7 @@ impl Default for DownloadsConfig {
     fn default() -> Self {
         Self {
             concurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
+            dash_segment_concurrency: DEFAULT_DASH_SEGMENT_CONCURRENCY,
         }
     }
 }
@@ -78,7 +74,22 @@ impl Config {
         }
 
         let contents = toml::to_string_pretty(self).context("failed to serialize config")?;
-        fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+        file.set_len(0)
+            .with_context(|| format!("failed to truncate {}", path.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to sync {}", path.display()))
     }
 }
 
@@ -98,4 +109,32 @@ pub fn music_download_dir() -> Result<PathBuf> {
     dirs::home_dir()
         .map(|home| home.join("Music"))
         .context("failed to resolve the user's Music directory")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn save_sets_owner_only_permissions() -> Result<()> {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tidaload-config-test-{}-{unique}",
+            std::process::id()
+        ));
+        let path = dir.join("config.toml");
+        fs::create_dir_all(&dir)?;
+        fs::write(&path, "old config")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+
+        Config::default().save(&path)?;
+
+        let mode = fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 }
