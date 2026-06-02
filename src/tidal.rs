@@ -825,6 +825,13 @@ mod tests {
     }
 
     #[test]
+    fn parses_copied_tidal_album_url_with_user_suffix() {
+        let parsed = parse_resource("https://tidal.com/album/496439179/u", None).unwrap();
+        assert!(matches!(parsed.kind, ResourceKind::Album));
+        assert_eq!(parsed.id, "496439179");
+    }
+
+    #[test]
     fn parses_tidal_playlist_url_with_uuid() {
         let parsed = parse_resource(
             "https://tidal.com/playlist/36ea71a8-445e-41a4-82ab-6628c581535d",

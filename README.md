@@ -13,9 +13,9 @@ tidaload login
 Download a track, album, or playlist URL:
 
 ```sh
-tidaload "https://tidal.com/browse/track/3083287"
-tidaload "https://tidal.com/browse/album/147569387"
-tidaload "https://tidal.com/browse/playlist/{playlist-id}"
+tidaload "https://tidal.com/track/526687566/u"
+tidaload "https://tidal.com/album/496439179/u"
+tidaload "https://tidal.com/playlist/36ea71a8-445e-41a4-82ab-6628c581535d"
 ```
 
 Raw IDs are supported when the resource kind is provided:

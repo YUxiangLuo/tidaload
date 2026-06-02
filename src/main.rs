@@ -590,6 +590,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_direct_copied_album_url_with_user_suffix() {
+        let cli = Cli::try_parse_from(["tidaload", "https://tidal.com/album/496439179/u"]).unwrap();
+
+        match cli.command {
+            Command::Direct(items) => {
+                assert_eq!(items, vec!["https://tidal.com/album/496439179/u"]);
+            }
+            command => panic!("expected direct download command, got {command:?}"),
+        }
+    }
+
+    #[test]
     fn parses_direct_raw_id_with_global_kind() {
         let cli = Cli::try_parse_from(["tidaload", "--kind", "track", "526687566"]).unwrap();
 
