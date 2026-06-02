@@ -803,6 +803,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_tidal_playlist_url_with_uuid() {
+        let parsed = parse_resource(
+            "https://tidal.com/playlist/36ea71a8-445e-41a4-82ab-6628c581535d",
+            None,
+        )
+        .unwrap();
+        assert!(matches!(parsed.kind, ResourceKind::Playlist));
+        assert_eq!(parsed.id, "36ea71a8-445e-41a4-82ab-6628c581535d");
+    }
+
+    #[test]
     fn builds_track_metadata_for_album_downloads() {
         let track = track_from_value(&serde_json::json!({
             "id": 42,
