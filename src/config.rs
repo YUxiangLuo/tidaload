@@ -31,6 +31,7 @@ pub struct TidalConfig {
 pub struct DownloadsConfig {
     pub concurrency: usize,
     pub dash_segment_concurrency: usize,
+    pub download_dir: Option<PathBuf>,
 }
 
 impl Default for TidalConfig {
@@ -50,6 +51,7 @@ impl Default for DownloadsConfig {
         Self {
             concurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
             dash_segment_concurrency: DEFAULT_DASH_SEGMENT_CONCURRENCY,
+            download_dir: None,
         }
     }
 }
@@ -101,7 +103,11 @@ pub fn default_config_path() -> PathBuf {
         .join("config.toml")
 }
 
-pub fn music_download_dir() -> Result<PathBuf> {
+pub fn music_download_dir(download_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = download_dir {
+        return expand_user_path(path);
+    }
+
     if let Some(path) = dirs::audio_dir() {
         return Ok(path);
     }
@@ -109,6 +115,24 @@ pub fn music_download_dir() -> Result<PathBuf> {
     dirs::home_dir()
         .map(|home| home.join("Music"))
         .context("failed to resolve the user's Music directory")
+}
+
+fn expand_user_path(path: &Path) -> Result<PathBuf> {
+    let Some(path_str) = path.to_str() else {
+        return Ok(path.to_path_buf());
+    };
+
+    if path_str == "~" {
+        return dirs::home_dir().context("failed to resolve the user's home directory");
+    }
+
+    if let Some(rest) = path_str.strip_prefix("~/") {
+        return dirs::home_dir()
+            .map(|home| home.join(rest))
+            .context("failed to resolve the user's home directory");
+    }
+
+    Ok(path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -135,6 +159,27 @@ mod tests {
         assert_eq!(mode, 0o600);
 
         fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn uses_configured_download_dir() -> Result<()> {
+        let path = Path::new("/tmp/tidaload-downloads");
+
+        assert_eq!(music_download_dir(Some(path))?, path);
+        Ok(())
+    }
+
+    #[test]
+    fn expands_tilde_download_dir() -> Result<()> {
+        let Some(home) = dirs::home_dir() else {
+            return Ok(());
+        };
+
+        assert_eq!(
+            music_download_dir(Some(Path::new("~/TIDAL")))?,
+            home.join("TIDAL")
+        );
         Ok(())
     }
 }

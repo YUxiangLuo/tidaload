@@ -52,6 +52,9 @@ struct Cli {
     #[arg(long, global = true)]
     dash_segment_concurrency: Option<usize>,
 
+    #[arg(long, global = true)]
+    download_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -87,6 +90,7 @@ async fn main() -> Result<()> {
                 cli.kind,
                 cli.concurrency,
                 cli.dash_segment_concurrency,
+                cli.download_dir,
                 items,
             )
             .await?;
@@ -102,6 +106,7 @@ async fn run_download(
     kind: Option<ResourceKind>,
     concurrency: Option<usize>,
     dash_segment_concurrency: Option<usize>,
+    download_dir: Option<PathBuf>,
     items: Vec<String>,
 ) -> Result<()> {
     if let Some(concurrency) = concurrency {
@@ -129,7 +134,11 @@ async fn run_download(
         .iter()
         .map(|item| parse_resource(item, kind))
         .collect::<Result<Vec<_>>>()?;
-    let download_root = music_download_dir()?;
+    let download_root = music_download_dir(
+        download_dir
+            .as_deref()
+            .or(config.downloads.download_dir.as_deref()),
+    )?;
 
     for resource in resources {
         download_resource(&client, config, resource, &download_root).await?;
@@ -683,6 +692,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(cli.dash_segment_concurrency, Some(12));
+        match cli.command {
+            Command::Direct(items) => {
+                assert_eq!(items, vec!["https://tidal.com/album/337502805/u"]);
+            }
+            command => panic!("expected direct download command, got {command:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_direct_download_with_download_dir() {
+        let cli = Cli::try_parse_from([
+            "tidaload",
+            "--download-dir",
+            "/tmp/tidaload-downloads",
+            "https://tidal.com/album/337502805/u",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.download_dir.as_deref(),
+            Some(Path::new("/tmp/tidaload-downloads"))
+        );
         match cli.command {
             Command::Direct(items) => {
                 assert_eq!(items, vec!["https://tidal.com/album/337502805/u"]);

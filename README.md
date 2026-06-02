@@ -20,4 +20,18 @@ tidaload "https://tidal.com/album/496439179/u"
 tidaload "https://tidal.com/playlist/36ea71a8-445e-41a4-82ab-6628c581535d"
 ```
 
+Downloads are saved under the current Linux user's Music folder by default.
+Use `--download-dir` for a single run:
+
+```sh
+tidaload --download-dir ~/Music/TIDAL "https://tidal.com/album/496439179/u"
+```
+
 The default config file is `~/.config/tidaload/config.toml`.
+
+Example download directory config:
+
+```toml
+[downloads]
+download_dir = "/home/alice/Music/TIDAL"
+```
