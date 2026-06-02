@@ -6,12 +6,13 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit, StreamCipher, block_padding::NoPadding};
 use ctr::Ctr64BE;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
 type Aes128Ctr = Ctr64BE<Aes128>;
+const DASH_SEGMENT_DOWNLOAD_CONCURRENCY: usize = 4;
 
 pub async fn download_to_file(
     client: &reqwest::Client,
@@ -72,9 +73,27 @@ pub async fn download_segmented_to_file(
         .with_context(|| format!("failed to create {}", tmp_path.display()))?;
 
     append_url(client, initialization_url, &tmp_path, &mut output).await?;
-    for number in start_number..start_number + segment_count {
-        let segment_url = media_url_template.replace("$Number$", &number.to_string());
-        append_url(client, &segment_url, &tmp_path, &mut output).await?;
+    let segment_end = start_number
+        .checked_add(segment_count)
+        .ok_or_else(|| anyhow!("TIDAL DASH manifest has too many segments"))?;
+    let mut segments = stream::iter(start_number..segment_end)
+        .map(|number| {
+            let client = client.clone();
+            let segment_url = dash_segment_url(media_url_template, number);
+            async move {
+                fetch_url_bytes(&client, &segment_url)
+                    .await
+                    .with_context(|| format!("failed to download DASH segment {number}"))
+            }
+        })
+        .buffered(DASH_SEGMENT_DOWNLOAD_CONCURRENCY);
+
+    while let Some(segment) = segments.next().await {
+        let segment = segment?;
+        output
+            .write_all(&segment)
+            .await
+            .with_context(|| format!("failed to write {}", tmp_path.display()))?;
     }
 
     output.flush().await?;
@@ -130,6 +149,24 @@ async fn append_url(
     Ok(())
 }
 
+async fn fetch_url_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
+    let bytes = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("failed to request {url}"))?
+        .error_for_status()
+        .with_context(|| format!("download request failed for {url}"))?
+        .bytes()
+        .await
+        .with_context(|| format!("failed to read download response for {url}"))?;
+    Ok(bytes.to_vec())
+}
+
+fn dash_segment_url(media_url_template: &str, number: u32) -> String {
+    media_url_template.replace("$Number$", &number.to_string())
+}
+
 fn decrypt_tidal_file(data: &[u8], encryption_key: &str) -> Result<Vec<u8>> {
     let master_key = STANDARD
         .decode("UIlTTEMmmLfGowo/UC60x2H45W6MdGgTRfo/umg4754=")
@@ -178,5 +215,18 @@ pub fn sanitize_file_name(value: &str) -> String {
         "Unknown".to_string()
     } else {
         cleaned
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_dash_segment_url() {
+        assert_eq!(
+            dash_segment_url("https://audio.example/$Number$.mp4?token=x", 42),
+            "https://audio.example/42.mp4?token=x"
+        );
     }
 }

@@ -45,7 +45,8 @@ Audio quality is fixed to lossless playback. tidaload first requests TIDAL's
 `HI_RES_LOSSLESS` FLAC/DASH manifest because the legacy `LOSSLESS` playback
 endpoint can be downgraded by TIDAL to AAC `HIGH`; if FLAC/DASH is unavailable,
 it falls back to `LOSSLESS`. DASH audio is saved as an `.m4a` fragmented MP4
-container with a FLAC audio stream.
+container with a FLAC audio stream. DASH media segments are downloaded with
+limited per-track concurrency and written back in segment order.
 
 DNS resolution is handled through DNS-over-HTTPS using `dns.google`, with a short
 in-process cache. This avoids relying on the local Linux resolver for TIDAL API
