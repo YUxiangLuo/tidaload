@@ -2,6 +2,8 @@
 
 A small Rust CLI for downloading TIDAL tracks, albums, and playlists.
 
+Linux only now.
+
 ## Usage
 
 Log in first:
