@@ -9,6 +9,7 @@ mod tidal;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -22,7 +23,8 @@ use crate::config::{
     Config, DEFAULT_DOWNLOAD_CONCURRENCY, default_config_path, music_download_dir,
 };
 use crate::download::{
-    download_segmented_to_file, download_to_file, remove_existing_path, sanitize_file_name,
+    DownloadProgress, ProgressCallback, download_segmented_to_file, download_to_file,
+    remove_existing_path, sanitize_file_name,
 };
 use crate::tidal::{
     Album, DownloadInfo, ParsedResource, Playlist, ResourceKind, TidalClient, Track,
@@ -207,18 +209,22 @@ async fn download_tracks_concurrently(
     let concurrency = config.downloads.concurrency.max(1);
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let cover_cache = Arc::new(Mutex::new(HashMap::new()));
+    let completed_tracks = Arc::new(AtomicUsize::new(0));
+    let total_tracks = tracks.len();
 
     let results: Vec<Result<()>> = stream::iter(tracks.into_iter().enumerate())
         .map(|(index, track)| {
             let semaphore = Arc::clone(&semaphore);
             let cover_cache = Arc::clone(&cover_cache);
+            let completed_tracks = Arc::clone(&completed_tracks);
             let folder = folder.clone();
             async move {
                 let _permit = semaphore.acquire_owned().await?;
                 let delay = track_start_delay(index, concurrency);
                 if !delay.is_zero() {
                     println!(
-                        "Waiting {:.1}s before next track",
+                        "{} Waiting {:.1}s before next track",
+                        track_scope(index, total_tracks),
                         delay.as_millis() as f64 / 1000.0
                     );
                     sleep(delay).await;
@@ -233,15 +239,28 @@ async fn download_tracks_concurrently(
                     } => disc_subdirectories,
                     TrackNumbering::Playlist => false,
                 };
-                download_track(
+                let result = download_track(
                     client,
                     track,
                     &folder,
                     playlist_position,
                     disc_subdirectories,
                     &cover_cache,
+                    TrackProgressScope {
+                        index: index + 1,
+                        total: total_tracks,
+                    },
                 )
-                .await
+                .await;
+
+                let finished = completed_tracks.fetch_add(1, Ordering::SeqCst) + 1;
+                match &result {
+                    Ok(()) => println!("[global {finished}/{total_tracks}] Track complete"),
+                    Err(err) => {
+                        eprintln!("[global {finished}/{total_tracks}] Track failed: {err:#}")
+                    }
+                }
+                result
             }
         })
         .buffer_unordered(concurrency)
@@ -265,7 +284,30 @@ async fn download_tracks_concurrently(
 
 async fn download_single_track(client: &TidalClient, track: Track, folder: &Path) -> Result<()> {
     let cover_cache = Arc::new(Mutex::new(HashMap::new()));
-    download_track(client, track, folder, None, false, &cover_cache).await
+    download_track(
+        client,
+        track,
+        folder,
+        None,
+        false,
+        &cover_cache,
+        TrackProgressScope { index: 1, total: 1 },
+    )
+    .await?;
+    println!("[global 1/1] Track complete");
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TrackProgressScope {
+    index: usize,
+    total: usize,
+}
+
+impl TrackProgressScope {
+    fn label(self) -> String {
+        track_scope(self.index.saturating_sub(1), self.total)
+    }
 }
 
 async fn download_track(
@@ -275,12 +317,24 @@ async fn download_track(
     playlist_position: Option<usize>,
     disc_subdirectories: bool,
     cover_cache: &CoverCache,
+    progress_scope: TrackProgressScope,
 ) -> Result<()> {
     if !track.allow_streaming {
-        println!("Skipping unavailable track {} ({})", track.title, track.id);
+        println!(
+            "{} Skipping unavailable track {} ({})",
+            progress_scope.label(),
+            track.title,
+            track.id
+        );
         return Ok(());
     }
 
+    println!(
+        "{} Preparing: {} - {}",
+        progress_scope.label(),
+        track.artist,
+        track.title
+    );
     let info = client
         .get_download_info(&track.id)
         .await
@@ -295,13 +349,28 @@ async fn download_track(
     let path = target_folder.join(filename);
     remove_existing_path(&path).await?;
 
-    println!("Downloading: {} - {}", track.artist, track.title);
+    println!(
+        "{} Downloading: {} - {}",
+        progress_scope.label(),
+        track.artist,
+        track.title
+    );
+    let progress_callback = track_progress_callback(progress_scope, &track);
     match &info {
         DownloadInfo::Direct {
             url,
             encryption_key,
             ..
-        } => download_to_file(client.http_client(), url, &path, encryption_key.as_deref()).await,
+        } => {
+            download_to_file(
+                client.http_client(),
+                url,
+                &path,
+                encryption_key.as_deref(),
+                Some(Arc::clone(&progress_callback)),
+            )
+            .await
+        }
         DownloadInfo::Segmented {
             initialization_url,
             media_url_template,
@@ -316,6 +385,7 @@ async fn download_track(
                 *start_number,
                 *segment_count,
                 &path,
+                Some(Arc::clone(&progress_callback)),
             )
             .await
         }
@@ -324,8 +394,37 @@ async fn download_track(
     embed_cover_art(client.http_client(), &track, &path, cover_cache)
         .await
         .with_context(|| format!("failed to embed cover art for {}", track.id))?;
-    println!("Saved: {}", path.display());
+    println!("{} Saved: {}", progress_scope.label(), path.display());
     Ok(())
+}
+
+fn track_progress_callback(progress_scope: TrackProgressScope, track: &Track) -> ProgressCallback {
+    let label = progress_scope.label();
+    let title = format!("{} - {}", track.artist, track.title);
+
+    Arc::new(move |progress| match progress {
+        DownloadProgress::DirectBytes { downloaded, total } => {
+            println!(
+                "{label} {title}: downloaded {}{}",
+                format_bytes(downloaded),
+                total
+                    .map(|total| format!(" / {}", format_bytes(total)))
+                    .unwrap_or_default()
+            );
+        }
+        DownloadProgress::DashInitialized => {
+            println!("{label} {title}: DASH initialization downloaded");
+        }
+        DownloadProgress::DashSegment { downloaded, total } => {
+            if should_log_dash_segment_progress(downloaded, total) {
+                println!("{label} {title}: DASH segments {downloaded}/{total}");
+            }
+        }
+    })
+}
+
+fn should_log_dash_segment_progress(downloaded: u32, total: u32) -> bool {
+    downloaded == 1 || downloaded == total || downloaded % 8 == 0
 }
 
 async fn embed_cover_art(
@@ -395,6 +494,15 @@ fn track_filename(track: &Track, extension: &str, playlist_position: Option<usiz
     format!("{name}.{extension}")
 }
 
+fn track_scope(index: usize, total: usize) -> String {
+    format!("[{}/{}]", index + 1, total.max(1))
+}
+
+fn format_bytes(bytes: u64) -> String {
+    let mib = bytes as f64 / 1024.0 / 1024.0;
+    format!("{mib:.1} MiB")
+}
+
 fn track_start_delay(index: usize, concurrency: usize) -> Duration {
     if index < concurrency {
         return Duration::ZERO;
@@ -443,5 +551,19 @@ mod tests {
             assert!(delay >= Duration::from_millis(TRACK_START_DELAY_MIN_MS));
             assert!(delay <= Duration::from_millis(TRACK_START_DELAY_MAX_MS));
         }
+    }
+
+    #[test]
+    fn formats_track_scope() {
+        assert_eq!(track_scope(0, 12), "[1/12]");
+        assert_eq!(track_scope(2, 0), "[3/1]");
+    }
+
+    #[test]
+    fn logs_dash_segment_progress_periodically() {
+        assert!(should_log_dash_segment_progress(1, 32));
+        assert!(should_log_dash_segment_progress(8, 32));
+        assert!(should_log_dash_segment_progress(32, 32));
+        assert!(!should_log_dash_segment_progress(7, 32));
     }
 }

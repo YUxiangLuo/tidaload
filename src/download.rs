@@ -1,4 +1,6 @@
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use aes::Aes128;
 use anyhow::{Context, Result, anyhow};
@@ -13,12 +15,23 @@ use tokio::io::AsyncWriteExt;
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
 type Aes128Ctr = Ctr64BE<Aes128>;
 const DASH_SEGMENT_DOWNLOAD_CONCURRENCY: usize = 4;
+const DIRECT_PROGRESS_INTERVAL_BYTES: u64 = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+pub enum DownloadProgress {
+    DirectBytes { downloaded: u64, total: Option<u64> },
+    DashInitialized,
+    DashSegment { downloaded: u32, total: u32 },
+}
+
+pub type ProgressCallback = Arc<dyn Fn(DownloadProgress) + Send + Sync>;
 
 pub async fn download_to_file(
     client: &reqwest::Client,
     url: &str,
     path: &Path,
     encryption_key: Option<&str>,
+    progress: Option<ProgressCallback>,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -30,7 +43,7 @@ pub async fn download_to_file(
     let mut output = fs::File::create(&tmp_path)
         .await
         .with_context(|| format!("failed to create {}", tmp_path.display()))?;
-    append_url(client, url, &tmp_path, &mut output).await?;
+    append_url(client, url, &tmp_path, &mut output, progress.as_ref()).await?;
     output.flush().await?;
     drop(output);
 
@@ -60,6 +73,7 @@ pub async fn download_segmented_to_file(
     start_number: u32,
     segment_count: u32,
     path: &Path,
+    progress: Option<ProgressCallback>,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -72,18 +86,33 @@ pub async fn download_segmented_to_file(
         .await
         .with_context(|| format!("failed to create {}", tmp_path.display()))?;
 
-    append_url(client, initialization_url, &tmp_path, &mut output).await?;
+    append_url(client, initialization_url, &tmp_path, &mut output, None).await?;
+    if let Some(progress) = progress.as_ref() {
+        progress(DownloadProgress::DashInitialized);
+    }
+
     let segment_end = start_number
         .checked_add(segment_count)
         .ok_or_else(|| anyhow!("TIDAL DASH manifest has too many segments"))?;
+    let downloaded_segments = Arc::new(AtomicU32::new(0));
     let mut segments = stream::iter(start_number..segment_end)
         .map(|number| {
             let client = client.clone();
+            let progress = progress.clone();
+            let downloaded_segments = Arc::clone(&downloaded_segments);
             let segment_url = dash_segment_url(media_url_template, number);
             async move {
-                fetch_url_bytes(&client, &segment_url)
+                let bytes = fetch_url_bytes(&client, &segment_url)
                     .await
-                    .with_context(|| format!("failed to download DASH segment {number}"))
+                    .with_context(|| format!("failed to download DASH segment {number}"))?;
+                if let Some(progress) = progress.as_ref() {
+                    let downloaded = downloaded_segments.fetch_add(1, Ordering::SeqCst) + 1;
+                    progress(DownloadProgress::DashSegment {
+                        downloaded,
+                        total: segment_count,
+                    });
+                }
+                Ok::<Vec<u8>, anyhow::Error>(bytes)
             }
         })
         .buffered(DASH_SEGMENT_DOWNLOAD_CONCURRENCY);
@@ -128,6 +157,7 @@ async fn append_url(
     url: &str,
     tmp_path: &Path,
     output: &mut fs::File,
+    progress: Option<&ProgressCallback>,
 ) -> Result<()> {
     let response = client
         .get(url)
@@ -136,14 +166,30 @@ async fn append_url(
         .with_context(|| format!("failed to request {url}"))?
         .error_for_status()
         .with_context(|| format!("download request failed for {url}"))?;
+    let total = response.content_length();
     let mut stream = response.bytes_stream();
+    let mut downloaded = 0u64;
+    let mut next_progress_at = DIRECT_PROGRESS_INTERVAL_BYTES;
+    let mut last_progress_downloaded = 0u64;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("failed while reading download stream")?;
+        downloaded += chunk.len() as u64;
         output
             .write_all(&chunk)
             .await
             .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+        if let Some(progress) = progress {
+            if downloaded >= next_progress_at {
+                progress(DownloadProgress::DirectBytes { downloaded, total });
+                last_progress_downloaded = downloaded;
+                next_progress_at = downloaded + DIRECT_PROGRESS_INTERVAL_BYTES;
+            }
+        }
+    }
+
+    if let Some(progress) = progress.filter(|_| downloaded != last_progress_downloaded) {
+        progress(DownloadProgress::DirectBytes { downloaded, total });
     }
 
     Ok(())

@@ -34,6 +34,8 @@ cargo run -- download --concurrency 8 "https://tidal.com/browse/playlist/{playli
 By default, album and playlist downloads use at most 2 concurrent track
 downloads. Later tracks start with a small irregular delay to avoid bursty
 request patterns. `--concurrency` can override the default for a single run.
+The CLI prints coarse global progress and per-track activity, including DASH
+segment progress, so long downloads visibly continue moving.
 
 Downloads are always saved under the current Linux user's Music folder.
 Before writing, tidaload deletes any existing track file or album/playlist folder
