@@ -20,11 +20,12 @@ use tokio::sync::{Mutex, Semaphore};
 use tokio::time::sleep;
 
 use crate::config::{
-    Config, DEFAULT_DOWNLOAD_CONCURRENCY, default_config_path, music_download_dir,
+    Config, DEFAULT_DASH_SEGMENT_CONCURRENCY, DEFAULT_DOWNLOAD_CONCURRENCY, default_config_path,
+    music_download_dir,
 };
 use crate::download::{
-    DownloadProgress, ProgressCallback, download_segmented_to_file, download_to_file,
-    remove_existing_path, sanitize_file_name,
+    DownloadProgress, ProgressCallback, SegmentedDownload, download_segmented_to_file,
+    download_to_file, remove_existing_path, sanitize_file_name,
 };
 use crate::tidal::{
     Album, DownloadInfo, ParsedResource, Playlist, ResourceKind, TidalClient, Track,
@@ -32,8 +33,8 @@ use crate::tidal::{
 };
 
 type CoverCache = Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>;
-const TRACK_START_DELAY_MIN_MS: u64 = 2_500;
-const TRACK_START_DELAY_MAX_MS: u64 = 11_000;
+const TRACK_START_DELAY_MIN_MS: u64 = 2_000;
+const TRACK_START_DELAY_MAX_MS: u64 = 6_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "tidaload")]
@@ -47,6 +48,9 @@ struct Cli {
 
     #[arg(long, global = true)]
     concurrency: Option<usize>,
+
+    #[arg(long, global = true)]
+    dash_segment_concurrency: Option<usize>,
 
     #[command(subcommand)]
     command: Command,
@@ -77,7 +81,15 @@ async fn main() -> Result<()> {
             println!("Saved TIDAL credentials to {}", cli.config.display());
         }
         Command::Download { items } | Command::Direct(items) => {
-            run_download(&mut config, &cli.config, cli.kind, cli.concurrency, items).await?;
+            run_download(
+                &mut config,
+                &cli.config,
+                cli.kind,
+                cli.concurrency,
+                cli.dash_segment_concurrency,
+                items,
+            )
+            .await?;
         }
     }
 
@@ -89,6 +101,7 @@ async fn run_download(
     config_path: &Path,
     kind: Option<ResourceKind>,
     concurrency: Option<usize>,
+    dash_segment_concurrency: Option<usize>,
     items: Vec<String>,
 ) -> Result<()> {
     if let Some(concurrency) = concurrency {
@@ -98,6 +111,11 @@ async fn run_download(
             .downloads
             .concurrency
             .clamp(1, DEFAULT_DOWNLOAD_CONCURRENCY);
+    }
+    if let Some(dash_segment_concurrency) = dash_segment_concurrency {
+        config.downloads.dash_segment_concurrency = dash_segment_concurrency.max(1);
+    } else if config.downloads.dash_segment_concurrency == 0 {
+        config.downloads.dash_segment_concurrency = DEFAULT_DASH_SEGMENT_CONCURRENCY;
     }
 
     let mut client = TidalClient::new(config.tidal.clone())?;
@@ -129,7 +147,7 @@ async fn download_resource(
     match resource.kind {
         ResourceKind::Track => {
             let track = client.get_track(&resource.id).await?;
-            download_single_track(client, track, download_root).await?;
+            download_single_track(client, config, track, download_root).await?;
         }
         ResourceKind::Album => {
             let album = client.get_album(&resource.id).await?;
@@ -217,6 +235,7 @@ async fn download_tracks_concurrently(
     numbering: TrackNumbering,
 ) -> Result<()> {
     let concurrency = config.downloads.concurrency.max(1);
+    let dash_segment_concurrency = config.downloads.dash_segment_concurrency.max(1);
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let cover_cache = Arc::new(Mutex::new(HashMap::new()));
     let completed_tracks = Arc::new(AtomicUsize::new(0));
@@ -253,12 +272,15 @@ async fn download_tracks_concurrently(
                     client,
                     track,
                     &folder,
-                    playlist_position,
-                    disc_subdirectories,
                     &cover_cache,
-                    TrackProgressScope {
-                        index: index + 1,
-                        total: total_tracks,
+                    TrackDownloadOptions {
+                        playlist_position,
+                        disc_subdirectories,
+                        dash_segment_concurrency,
+                        progress_scope: TrackProgressScope {
+                            index: index + 1,
+                            total: total_tracks,
+                        },
                     },
                 )
                 .await;
@@ -292,16 +314,24 @@ async fn download_tracks_concurrently(
     Ok(())
 }
 
-async fn download_single_track(client: &TidalClient, track: Track, folder: &Path) -> Result<()> {
+async fn download_single_track(
+    client: &TidalClient,
+    config: &Config,
+    track: Track,
+    folder: &Path,
+) -> Result<()> {
     let cover_cache = Arc::new(Mutex::new(HashMap::new()));
     download_track(
         client,
         track,
         folder,
-        None,
-        false,
         &cover_cache,
-        TrackProgressScope { index: 1, total: 1 },
+        TrackDownloadOptions {
+            playlist_position: None,
+            disc_subdirectories: false,
+            dash_segment_concurrency: config.downloads.dash_segment_concurrency,
+            progress_scope: TrackProgressScope { index: 1, total: 1 },
+        },
     )
     .await?;
     println!("[global 1/1] Track complete");
@@ -314,6 +344,14 @@ struct TrackProgressScope {
     total: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TrackDownloadOptions {
+    playlist_position: Option<usize>,
+    disc_subdirectories: bool,
+    dash_segment_concurrency: usize,
+    progress_scope: TrackProgressScope,
+}
+
 impl TrackProgressScope {
     fn label(self) -> String {
         track_scope(self.index.saturating_sub(1), self.total)
@@ -324,11 +362,10 @@ async fn download_track(
     client: &TidalClient,
     track: Track,
     folder: &Path,
-    playlist_position: Option<usize>,
-    disc_subdirectories: bool,
     cover_cache: &CoverCache,
-    progress_scope: TrackProgressScope,
+    options: TrackDownloadOptions,
 ) -> Result<()> {
+    let progress_scope = options.progress_scope;
     if !track.allow_streaming {
         println!(
             "{} Skipping unavailable track {} ({})",
@@ -350,8 +387,8 @@ async fn download_track(
         .await
         .with_context(|| format!("failed to get playback info for {}", track.id))?;
 
-    let filename = track_filename(&track, info.extension(), playlist_position);
-    let target_folder = if disc_subdirectories {
+    let filename = track_filename(&track, info.extension(), options.playlist_position);
+    let target_folder = if options.disc_subdirectories {
         folder.join(format!("Disc {}", track.volume_number.unwrap_or(1)))
     } else {
         folder.to_path_buf()
@@ -390,10 +427,13 @@ async fn download_track(
         } => {
             download_segmented_to_file(
                 client.http_client(),
-                initialization_url,
-                media_url_template,
-                *start_number,
-                *segment_count,
+                SegmentedDownload {
+                    initialization_url,
+                    media_url_template,
+                    start_number: *start_number,
+                    segment_count: *segment_count,
+                    dash_segment_concurrency: options.dash_segment_concurrency,
+                },
                 &path,
                 Some(Arc::clone(&progress_callback)),
             )
@@ -434,7 +474,7 @@ fn track_progress_callback(progress_scope: TrackProgressScope, track: &Track) ->
 }
 
 fn should_log_dash_segment_progress(downloaded: u32, total: u32) -> bool {
-    downloaded == 1 || downloaded == total || downloaded % 8 == 0
+    downloaded == 1 || downloaded == total || downloaded.is_multiple_of(8)
 }
 
 async fn embed_cover_art(
@@ -628,6 +668,25 @@ mod tests {
                 items,
                 vec!["https://tidal.com/playlist/36ea71a8-445e-41a4-82ab-6628c581535d"]
             ),
+            command => panic!("expected direct download command, got {command:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_direct_download_with_dash_segment_concurrency() {
+        let cli = Cli::try_parse_from([
+            "tidaload",
+            "--dash-segment-concurrency",
+            "12",
+            "https://tidal.com/album/337502805/u",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.dash_segment_concurrency, Some(12));
+        match cli.command {
+            Command::Direct(items) => {
+                assert_eq!(items, vec!["https://tidal.com/album/337502805/u"]);
+            }
             command => panic!("expected direct download command, got {command:?}"),
         }
     }

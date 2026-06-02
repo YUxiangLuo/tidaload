@@ -14,7 +14,6 @@ use tokio::io::AsyncWriteExt;
 
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
 type Aes128Ctr = Ctr64BE<Aes128>;
-const DASH_SEGMENT_DOWNLOAD_CONCURRENCY: usize = 4;
 const DIRECT_PROGRESS_INTERVAL_BYTES: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
@@ -25,6 +24,15 @@ pub enum DownloadProgress {
 }
 
 pub type ProgressCallback = Arc<dyn Fn(DownloadProgress) + Send + Sync>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct SegmentedDownload<'a> {
+    pub initialization_url: &'a str,
+    pub media_url_template: &'a str,
+    pub start_number: u32,
+    pub segment_count: u32,
+    pub dash_segment_concurrency: usize,
+}
 
 pub async fn download_to_file(
     client: &reqwest::Client,
@@ -68,10 +76,7 @@ pub async fn download_to_file(
 
 pub async fn download_segmented_to_file(
     client: &reqwest::Client,
-    initialization_url: &str,
-    media_url_template: &str,
-    start_number: u32,
-    segment_count: u32,
+    download: SegmentedDownload<'_>,
     path: &Path,
     progress: Option<ProgressCallback>,
 ) -> Result<()> {
@@ -86,21 +91,30 @@ pub async fn download_segmented_to_file(
         .await
         .with_context(|| format!("failed to create {}", tmp_path.display()))?;
 
-    append_url(client, initialization_url, &tmp_path, &mut output, None).await?;
+    append_url(
+        client,
+        download.initialization_url,
+        &tmp_path,
+        &mut output,
+        None,
+    )
+    .await?;
     if let Some(progress) = progress.as_ref() {
         progress(DownloadProgress::DashInitialized);
     }
 
-    let segment_end = start_number
-        .checked_add(segment_count)
+    let segment_end = download
+        .start_number
+        .checked_add(download.segment_count)
         .ok_or_else(|| anyhow!("TIDAL DASH manifest has too many segments"))?;
     let downloaded_segments = Arc::new(AtomicU32::new(0));
-    let mut segments = stream::iter(start_number..segment_end)
+    let dash_segment_concurrency = download.dash_segment_concurrency.max(1);
+    let mut segments = stream::iter(download.start_number..segment_end)
         .map(|number| {
             let client = client.clone();
             let progress = progress.clone();
             let downloaded_segments = Arc::clone(&downloaded_segments);
-            let segment_url = dash_segment_url(media_url_template, number);
+            let segment_url = dash_segment_url(download.media_url_template, number);
             async move {
                 let bytes = fetch_url_bytes(&client, &segment_url)
                     .await
@@ -109,13 +123,13 @@ pub async fn download_segmented_to_file(
                     let downloaded = downloaded_segments.fetch_add(1, Ordering::SeqCst) + 1;
                     progress(DownloadProgress::DashSegment {
                         downloaded,
-                        total: segment_count,
+                        total: download.segment_count,
                     });
                 }
                 Ok::<Vec<u8>, anyhow::Error>(bytes)
             }
         })
-        .buffered(DASH_SEGMENT_DOWNLOAD_CONCURRENCY);
+        .buffered(dash_segment_concurrency);
 
     while let Some(segment) = segments.next().await {
         let segment = segment?;
@@ -179,12 +193,12 @@ async fn append_url(
             .write_all(&chunk)
             .await
             .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-        if let Some(progress) = progress {
-            if downloaded >= next_progress_at {
-                progress(DownloadProgress::DirectBytes { downloaded, total });
-                last_progress_downloaded = downloaded;
-                next_progress_at = downloaded + DIRECT_PROGRESS_INTERVAL_BYTES;
-            }
+        if let Some(progress) = progress
+            && downloaded >= next_progress_at
+        {
+            progress(DownloadProgress::DirectBytes { downloaded, total });
+            last_progress_downloaded = downloaded;
+            next_progress_at = downloaded + DIRECT_PROGRESS_INTERVAL_BYTES;
         }
     }
 

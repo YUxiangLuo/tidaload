@@ -29,11 +29,14 @@ Useful options:
 
 ```sh
 tidaload --concurrency 8 "https://tidal.com/browse/playlist/{playlist-id}"
+tidaload --dash-segment-concurrency 12 "https://tidal.com/album/{album-id}"
 ```
 
 By default, album and playlist downloads use at most 2 concurrent track
 downloads. Later tracks start with a small irregular delay to avoid bursty
 request patterns. `--concurrency` can override the default for a single run.
+`--dash-segment-concurrency` controls concurrent DASH segment requests per
+track; the default is 8.
 The CLI prints coarse global progress and per-track activity, including DASH
 segment progress, so long downloads visibly continue moving.
 
