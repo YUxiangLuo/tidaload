@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -50,7 +52,9 @@ impl Default for TidalConfig {
 
 impl Default for DownloadsConfig {
     fn default() -> Self {
-        Self { concurrency: 4 }
+        Self {
+            concurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
+        }
     }
 }
 

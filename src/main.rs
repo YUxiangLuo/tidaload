@@ -9,14 +9,18 @@ mod tidal;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::stream::{self, StreamExt};
 use mp4ameta::{Img, Tag};
 use tokio::sync::{Mutex, Semaphore};
+use tokio::time::sleep;
 
-use crate::config::{Config, default_config_path, music_download_dir};
+use crate::config::{
+    Config, DEFAULT_DOWNLOAD_CONCURRENCY, default_config_path, music_download_dir,
+};
 use crate::download::{
     download_segmented_to_file, download_to_file, remove_existing_path, sanitize_file_name,
 };
@@ -26,6 +30,8 @@ use crate::tidal::{
 };
 
 type CoverCache = Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>;
+const TRACK_START_DELAY_MIN_MS: u64 = 2_500;
+const TRACK_START_DELAY_MAX_MS: u64 = 11_000;
 
 #[derive(Debug, Parser)]
 #[command(name = "tidaload")]
@@ -73,6 +79,11 @@ async fn main() -> Result<()> {
         } => {
             if let Some(concurrency) = concurrency {
                 config.downloads.concurrency = concurrency.max(1);
+            } else {
+                config.downloads.concurrency = config
+                    .downloads
+                    .concurrency
+                    .clamp(1, DEFAULT_DOWNLOAD_CONCURRENCY);
             }
 
             let mut client = TidalClient::new(config.tidal.clone())?;
@@ -193,7 +204,8 @@ async fn download_tracks_concurrently(
     folder: PathBuf,
     numbering: TrackNumbering,
 ) -> Result<()> {
-    let semaphore = Arc::new(Semaphore::new(config.downloads.concurrency.max(1)));
+    let concurrency = config.downloads.concurrency.max(1);
+    let semaphore = Arc::new(Semaphore::new(concurrency));
     let cover_cache = Arc::new(Mutex::new(HashMap::new()));
 
     let results: Vec<Result<()>> = stream::iter(tracks.into_iter().enumerate())
@@ -203,6 +215,14 @@ async fn download_tracks_concurrently(
             let folder = folder.clone();
             async move {
                 let _permit = semaphore.acquire_owned().await?;
+                let delay = track_start_delay(index, concurrency);
+                if !delay.is_zero() {
+                    println!(
+                        "Waiting {:.1}s before next track",
+                        delay.as_millis() as f64 / 1000.0
+                    );
+                    sleep(delay).await;
+                }
                 let playlist_position = match numbering {
                     TrackNumbering::Playlist => Some(index + 1),
                     TrackNumbering::Album { .. } => None,
@@ -224,7 +244,7 @@ async fn download_tracks_concurrently(
                 .await
             }
         })
-        .buffer_unordered(config.downloads.concurrency.max(1))
+        .buffer_unordered(concurrency)
         .collect()
         .await;
 
@@ -373,4 +393,55 @@ fn track_filename(track: &Track, extension: &str, playlist_position: Option<usiz
         .unwrap_or_default();
     let name = sanitize_file_name(&format!("{number}{} - {}", track.artist, track.title));
     format!("{name}.{extension}")
+}
+
+fn track_start_delay(index: usize, concurrency: usize) -> Duration {
+    if index < concurrency {
+        return Duration::ZERO;
+    }
+
+    irregular_track_delay(delay_seed(index))
+}
+
+fn irregular_track_delay(seed: u64) -> Duration {
+    let span = TRACK_START_DELAY_MAX_MS - TRACK_START_DELAY_MIN_MS + 1;
+    Duration::from_millis(TRACK_START_DELAY_MIN_MS + xorshift64(seed) % span)
+}
+
+fn delay_seed(index: usize) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or_default();
+    now ^ ((index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+fn xorshift64(mut value: u64) -> u64 {
+    if value == 0 {
+        value = 0xA076_1D64_78BD_642F;
+    }
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skips_delay_for_initial_concurrency_slots() {
+        assert_eq!(track_start_delay(0, 2), Duration::ZERO);
+        assert_eq!(track_start_delay(1, 2), Duration::ZERO);
+    }
+
+    #[test]
+    fn irregular_delay_stays_in_configured_bounds() {
+        for seed in [1, 2, 99, u64::MAX] {
+            let delay = irregular_track_delay(seed);
+            assert!(delay >= Duration::from_millis(TRACK_START_DELAY_MIN_MS));
+            assert!(delay <= Duration::from_millis(TRACK_START_DELAY_MAX_MS));
+        }
+    }
 }
