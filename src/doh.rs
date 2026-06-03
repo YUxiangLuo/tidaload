@@ -7,6 +7,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde::Deserialize;
 
+use crate::http::{HTTP_SHORT_REQUEST_TIMEOUT, configure_http_client, send_text_with_retries};
+
 const DOH_ENDPOINT: &str = "https://dns.google/resolve";
 const MIN_TTL: Duration = Duration::from_secs(30);
 const MAX_TTL: Duration = Duration::from_secs(300);
@@ -42,7 +44,7 @@ struct DnsAnswer {
 
 impl DohResolver {
     pub fn new() -> Result<Self> {
-        let client = reqwest::Client::builder()
+        let client = configure_http_client(reqwest::Client::builder())
             .user_agent("tidaload-doh/0.1")
             .resolve_to_addrs(
                 "dns.google",
@@ -69,17 +71,18 @@ impl DohResolver {
             return Ok(addrs);
         }
 
-        let response: DnsResponse = self
+        let request = self
             .client
             .get(DOH_ENDPOINT)
             .query(&[("name", host.as_str()), ("type", "A")])
-            .send()
+            .timeout(HTTP_SHORT_REQUEST_TIMEOUT);
+        let response = send_text_with_retries(request)
             .await
-            .with_context(|| format!("failed to query DoH for {host}"))?
-            .error_for_status()
-            .with_context(|| format!("DoH request failed for {host}"))?
-            .json()
-            .await
+            .with_context(|| format!("failed to query DoH for {host}"))?;
+        if !response.status.is_success() {
+            bail!("DoH request failed for {host}: {}", response.status);
+        }
+        let response: DnsResponse = serde_json::from_str(&response.body)
             .with_context(|| format!("failed to parse DoH response for {host}"))?;
 
         if response.status != 0 {

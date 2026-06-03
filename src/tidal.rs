@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,6 +13,10 @@ use tokio::time::{Duration, sleep};
 
 use crate::config::TidalConfig;
 use crate::doh::DohResolver;
+use crate::http::{
+    HTTP_SHORT_REQUEST_TIMEOUT, configure_http_client, send_json_with_retries,
+    send_text_with_retries,
+};
 
 const BASE: &str = "https://api.tidalhifi.com/v1";
 const SESSION_URL: &str = "https://api.tidal.com/v1/sessions";
@@ -68,6 +73,8 @@ pub enum DownloadInfo {
         url: String,
         extension: String,
         encryption_key: Option<String>,
+        native_flac: bool,
+        quality: PlaybackQuality,
     },
     Segmented {
         initialization_url: String,
@@ -75,6 +82,7 @@ pub enum DownloadInfo {
         start_number: u32,
         segment_count: u32,
         extension: String,
+        quality: PlaybackQuality,
     },
 }
 
@@ -84,6 +92,114 @@ impl DownloadInfo {
             Self::Direct { extension, .. } | Self::Segmented { extension, .. } => extension,
         }
     }
+
+    pub fn quality(&self) -> PlaybackQuality {
+        match self {
+            Self::Direct { quality, .. } | Self::Segmented { quality, .. } => *quality,
+        }
+    }
+
+    pub fn output_path(&self) -> OutputPath {
+        match self {
+            Self::Direct {
+                native_flac: true, ..
+            } => OutputPath::DirectNative,
+            Self::Direct { .. } => OutputPath::DirectEncode,
+            Self::Segmented { .. } => OutputPath::DashRemux,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackQuality {
+    HiResLossless,
+    Lossless,
+}
+
+impl PlaybackQuality {
+    pub fn as_tidal_param(self) -> &'static str {
+        match self {
+            Self::HiResLossless => "HI_RES_LOSSLESS",
+            Self::Lossless => "LOSSLESS",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputPath {
+    DashRemux,
+    DirectNative,
+    DirectEncode,
+}
+
+impl OutputPath {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::DashRemux => "DASH/fMP4 FLAC -> ffmpeg stream-copy remux -> native .flac",
+            Self::DirectNative => "direct native FLAC -> native .flac",
+            Self::DirectEncode => "direct non-FLAC -> ffmpeg FLAC encode -> native .flac",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybackFallbackReason {
+    MissingManifest,
+    MqaSource,
+    UnsupportedDashCodec,
+}
+
+impl PlaybackFallbackReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::MissingManifest => "missing manifest",
+            Self::MqaSource => "MQA source",
+            Self::UnsupportedDashCodec => "unsupported DASH codec",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PlaybackFallbackError {
+    quality: PlaybackQuality,
+    reason: PlaybackFallbackReason,
+    message: String,
+}
+
+impl PlaybackFallbackError {
+    fn new(quality: PlaybackQuality, reason: PlaybackFallbackReason, message: String) -> Self {
+        Self {
+            quality,
+            reason,
+            message,
+        }
+    }
+}
+
+impl fmt::Display for PlaybackFallbackError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} fallback candidate for {}: {}",
+            self.reason.label(),
+            self.quality.as_tidal_param(),
+            self.message
+        )
+    }
+}
+
+impl std::error::Error for PlaybackFallbackError {}
+
+fn playback_fallback_error(
+    quality: PlaybackQuality,
+    reason: PlaybackFallbackReason,
+    message: String,
+) -> anyhow::Error {
+    PlaybackFallbackError::new(quality, reason, message).into()
+}
+
+fn lossless_fallback_allowed(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<PlaybackFallbackError>().is_some()
 }
 
 #[derive(Debug, Deserialize)]
@@ -204,25 +320,36 @@ impl TidalClient {
     }
 
     pub async fn get_download_info(&self, track_id: &str) -> Result<DownloadInfo> {
-        match self.request_download_info(track_id, "HI_RES_LOSSLESS").await {
+        match self
+            .request_download_info(track_id, PlaybackQuality::HiResLossless)
+            .await
+        {
             Ok(info) => Ok(info),
-            Err(hi_res_error) => self
-                .request_download_info(track_id, "LOSSLESS")
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to get HI_RES_LOSSLESS playback info; fallback LOSSLESS also failed; HI_RES_LOSSLESS error: {hi_res_error:#}"
-                    )
-                }),
+            Err(hi_res_error) if lossless_fallback_allowed(&hi_res_error) => {
+                self.request_download_info(track_id, PlaybackQuality::Lossless)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to get HI_RES_LOSSLESS playback info; fallback LOSSLESS also failed; HI_RES_LOSSLESS error: {hi_res_error:#}"
+                        )
+                    })
+            }
+            Err(hi_res_error) => {
+                Err(hi_res_error).context("failed to get HI_RES_LOSSLESS playback info")
+            }
         }
     }
 
-    async fn request_download_info(&self, track_id: &str, quality: &str) -> Result<DownloadInfo> {
+    async fn request_download_info(
+        &self,
+        track_id: &str,
+        quality: PlaybackQuality,
+    ) -> Result<DownloadInfo> {
         let resp = self
             .api_get(
                 &format!("tracks/{track_id}/playbackinfopostpaywall"),
                 &[
-                    ("audioquality", quality.to_string()),
+                    ("audioquality", quality.as_tidal_param().to_string()),
                     ("playbackmode", "STREAM".to_string()),
                     ("assetpresentation", "FULL".to_string()),
                 ],
@@ -234,10 +361,14 @@ impl TidalClient {
                 .get("userMessage")
                 .and_then(Value::as_str)
                 .unwrap_or("TIDAL did not return a playback manifest");
-            bail!("{message}");
+            return Err(playback_fallback_error(
+                quality,
+                PlaybackFallbackReason::MissingManifest,
+                message.to_string(),
+            ));
         };
 
-        parse_manifest(manifest)
+        parse_manifest(manifest, quality)
     }
 
     async fn get_all_items(
@@ -282,18 +413,17 @@ impl TidalClient {
             .client
             .get(SESSION_URL)
             .bearer_auth(&self.config.access_token)
-            .send()
+            .timeout(HTTP_SHORT_REQUEST_TIMEOUT);
+        let resp = send_text_with_retries(resp)
             .await
             .context("failed to verify TIDAL access token")?;
 
-        if !resp.status().is_success() {
-            bail!("TIDAL login failed: {}", resp.status());
+        if !resp.status.is_success() {
+            bail!("TIDAL login failed: {}", resp.status);
         }
 
-        let body: Value = resp
-            .json()
-            .await
-            .context("invalid TIDAL session response")?;
+        let body: Value =
+            serde_json::from_str(&resp.body).context("invalid TIDAL session response")?;
         let user_id = body
             .get("userId")
             .and_then(Value::as_u64)
@@ -319,15 +449,13 @@ impl TidalClient {
             .client
             .post(format!("{AUTH_URL}/device_authorization"))
             .form(&[("client_id", self.client_id.as_str()), ("scope", SCOPE)])
-            .send()
+            .timeout(HTTP_SHORT_REQUEST_TIMEOUT);
+        let resp = send_text_with_retries(resp)
             .await
             .context("failed to request TIDAL device authorization")?;
 
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .context("failed to read TIDAL auth response")?;
+        let status = resp.status;
+        let body = resp.body;
         if !status.is_success() {
             bail!("TIDAL device authorization failed: {status} {body}");
         }
@@ -346,15 +474,13 @@ impl TidalClient {
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("scope", SCOPE),
             ])
-            .send()
+            .timeout(HTTP_SHORT_REQUEST_TIMEOUT);
+        let resp = send_json_with_retries::<Value>(resp)
             .await
             .context("failed to poll TIDAL auth status")?;
 
-        let status = resp.status();
-        let body: Value = resp
-            .json()
-            .await
-            .context("invalid TIDAL auth poll response")?;
+        let status = resp.status;
+        let body = resp.body;
         if status.is_success() {
             return serde_json::from_value(body)
                 .map(Some)
@@ -385,15 +511,13 @@ impl TidalClient {
                 ("grant_type", "refresh_token"),
                 ("scope", SCOPE),
             ])
-            .send()
+            .timeout(HTTP_SHORT_REQUEST_TIMEOUT);
+        let resp = send_json_with_retries::<Value>(resp)
             .await
             .context("failed to refresh TIDAL access token")?;
 
-        let status = resp.status();
-        let body: Value = resp
-            .json()
-            .await
-            .context("invalid TIDAL refresh response")?;
+        let status = resp.status;
+        let body = resp.body;
         if !status.is_success() {
             bail!("TIDAL token refresh failed: {body}");
         }
@@ -429,15 +553,13 @@ impl TidalClient {
             .get(&url)
             .bearer_auth(&self.config.access_token)
             .query(&query)
-            .send()
+            .timeout(HTTP_SHORT_REQUEST_TIMEOUT);
+        let resp = send_text_with_retries(resp)
             .await
             .with_context(|| format!("failed to request TIDAL API {path}"))?;
 
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .context("failed to read TIDAL API response")?;
+        let status = resp.status;
+        let body = resp.body;
         if !status.is_success() {
             bail!("TIDAL API request failed for {path}: {status} {body}");
         }
@@ -459,7 +581,7 @@ impl TidalClient {
 fn tidal_client_builder() -> Result<reqwest::ClientBuilder> {
     let doh_resolver = DohResolver::new()?;
 
-    Ok(reqwest::Client::builder()
+    Ok(configure_http_client(reqwest::Client::builder())
         .user_agent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:83.0) Gecko/20100101 Firefox/83.0",
         )
@@ -506,13 +628,13 @@ pub fn parse_resource(input: &str, fallback_kind: Option<ResourceKind>) -> Resul
     })
 }
 
-fn parse_manifest(manifest: &str) -> Result<DownloadInfo> {
+fn parse_manifest(manifest: &str, quality: PlaybackQuality) -> Result<DownloadInfo> {
     let decoded = STANDARD
         .decode(manifest)
         .context("failed to base64-decode TIDAL manifest")?;
     let decoded = std::str::from_utf8(&decoded).context("TIDAL manifest is not valid UTF-8")?;
     if decoded.trim_start().starts_with('<') {
-        return parse_dash_manifest(decoded);
+        return parse_dash_manifest(decoded, quality);
     }
 
     let value: Value = serde_json::from_str(decoded).context("failed to parse TIDAL manifest")?;
@@ -529,11 +651,17 @@ fn parse_manifest(manifest: &str) -> Result<DownloadInfo> {
         .and_then(Value::as_str)
         .unwrap_or("m4a")
         .to_ascii_lowercase();
-    let extension = if codec == "flac" || codec == "mqa" {
-        "flac"
-    } else {
-        "m4a"
-    };
+    if codec == "mqa" {
+        return Err(playback_fallback_error(
+            quality,
+            PlaybackFallbackReason::MqaSource,
+            format!(
+                "TIDAL returned MQA for {}; refusing MQA source",
+                quality.as_tidal_param()
+            ),
+        ));
+    }
+    let native_flac = codec == "flac";
 
     let encryption_key = if value
         .get("encryptionType")
@@ -551,14 +679,16 @@ fn parse_manifest(manifest: &str) -> Result<DownloadInfo> {
 
     Ok(DownloadInfo::Direct {
         url: url.to_string(),
-        extension: extension.to_string(),
+        extension: "flac".to_string(),
         encryption_key,
+        native_flac,
+        quality,
     })
 }
 
-fn parse_dash_manifest(manifest: &str) -> Result<DownloadInfo> {
+fn parse_dash_manifest(manifest: &str, quality: PlaybackQuality) -> Result<DownloadInfo> {
     let document = Document::parse(manifest).context("failed to parse TIDAL DASH manifest XML")?;
-    let representation = flac_representation(&document)?;
+    let representation = flac_representation(&document, quality)?;
     let template = segment_template_for(representation)
         .ok_or_else(|| anyhow!("TIDAL DASH manifest missing SegmentTemplate"))?;
     let initialization_url = template
@@ -578,11 +708,15 @@ fn parse_dash_manifest(manifest: &str) -> Result<DownloadInfo> {
         media_url_template: media_url_template.to_string(),
         start_number,
         segment_count,
-        extension: "m4a".to_string(),
+        extension: "flac".to_string(),
+        quality,
     })
 }
 
-fn flac_representation<'a, 'input>(document: &'a Document<'input>) -> Result<Node<'a, 'input>> {
+fn flac_representation<'a, 'input>(
+    document: &'a Document<'input>,
+    quality: PlaybackQuality,
+) -> Result<Node<'a, 'input>> {
     let mut saw_representation = false;
     let mut unsupported_codecs = Vec::new();
 
@@ -610,7 +744,11 @@ fn flac_representation<'a, 'input>(document: &'a Document<'input>) -> Result<Nod
         .filter(|codecs| !codecs.is_empty())
         .collect::<Vec<_>>()
         .join(", ");
-    bail!("unsupported TIDAL DASH codec: {codecs}");
+    Err(playback_fallback_error(
+        quality,
+        PlaybackFallbackReason::UnsupportedDashCodec,
+        format!("unsupported TIDAL DASH codec: {codecs}"),
+    ))
 }
 
 fn segment_template_for<'a, 'input>(representation: Node<'a, 'input>) -> Option<Node<'a, 'input>> {
@@ -914,6 +1052,122 @@ mod tests {
     }
 
     #[test]
+    fn parses_direct_flac_manifest_as_flac_file() {
+        let manifest = serde_json::json!({
+            "urls": ["https://audio.example/track.flac"],
+            "codecs": "flac",
+            "encryptionType": "NONE"
+        })
+        .to_string();
+        let encoded = STANDARD.encode(manifest);
+
+        let info = parse_manifest(&encoded, PlaybackQuality::Lossless).unwrap();
+        assert_eq!(info.quality(), PlaybackQuality::Lossless);
+        assert_eq!(info.output_path(), OutputPath::DirectNative);
+        match info {
+            DownloadInfo::Direct {
+                url,
+                extension,
+                encryption_key,
+                native_flac,
+                ..
+            } => {
+                assert_eq!(url, "https://audio.example/track.flac");
+                assert_eq!(extension, "flac");
+                assert!(encryption_key.is_none());
+                assert!(native_flac);
+            }
+            DownloadInfo::Segmented { .. } => panic!("expected direct download info"),
+        }
+    }
+
+    #[test]
+    fn parses_direct_mp4a_manifest_as_flac_output_needing_encode() {
+        let manifest = serde_json::json!({
+            "urls": ["https://audio.example/track.m4a"],
+            "codecs": "mp4a.40.2",
+            "encryptionType": "NONE"
+        })
+        .to_string();
+        let encoded = STANDARD.encode(manifest);
+
+        let info = parse_manifest(&encoded, PlaybackQuality::Lossless).unwrap();
+        assert_eq!(info.quality(), PlaybackQuality::Lossless);
+        assert_eq!(info.output_path(), OutputPath::DirectEncode);
+        match info {
+            DownloadInfo::Direct {
+                url,
+                extension,
+                native_flac,
+                ..
+            } => {
+                assert_eq!(url, "https://audio.example/track.m4a");
+                assert_eq!(extension, "flac");
+                assert!(!native_flac);
+            }
+            DownloadInfo::Segmented { .. } => panic!("expected direct download info"),
+        }
+    }
+
+    #[test]
+    fn rejects_direct_mqa_manifest() {
+        let manifest = serde_json::json!({
+            "urls": ["https://audio.example/track.flac"],
+            "codecs": "mqa",
+            "encryptionType": "NONE"
+        })
+        .to_string();
+        let encoded = STANDARD.encode(manifest);
+
+        let err = parse_manifest(&encoded, PlaybackQuality::HiResLossless).unwrap_err();
+        assert!(err.to_string().contains("refusing MQA source"));
+        assert!(lossless_fallback_allowed(&err));
+    }
+
+    #[test]
+    fn malformed_manifest_is_not_lossless_fallback_candidate() {
+        let err = parse_manifest("not base64", PlaybackQuality::HiResLossless).unwrap_err();
+        assert!(!lossless_fallback_allowed(&err));
+    }
+
+    #[test]
+    fn unsupported_dash_codec_is_lossless_fallback_candidate() {
+        let xml = r#"
+            <MPD>
+              <Period>
+                <AdaptationSet>
+                  <Representation codecs="mqa">
+                    <SegmentTemplate
+                      initialization="https://audio.example/init.mp4"
+                      media="https://audio.example/$Number$.mp4">
+                      <SegmentTimeline>
+                        <S d="100"/>
+                      </SegmentTimeline>
+                    </SegmentTemplate>
+                  </Representation>
+                </AdaptationSet>
+              </Period>
+            </MPD>
+        "#;
+        let encoded = STANDARD.encode(xml);
+
+        let err = parse_manifest(&encoded, PlaybackQuality::HiResLossless).unwrap_err();
+        assert!(err.to_string().contains("unsupported TIDAL DASH codec"));
+        assert!(lossless_fallback_allowed(&err));
+    }
+
+    #[test]
+    fn missing_hi_res_manifest_is_lossless_fallback_candidate() {
+        let err = playback_fallback_error(
+            PlaybackQuality::HiResLossless,
+            PlaybackFallbackReason::MissingManifest,
+            "quality unavailable".to_string(),
+        );
+
+        assert!(lossless_fallback_allowed(&err));
+    }
+
+    #[test]
     fn parses_flac_dash_manifest() {
         let xml = r#"
             <MPD>
@@ -936,7 +1190,9 @@ mod tests {
         "#;
         let encoded = STANDARD.encode(xml);
 
-        let info = parse_manifest(&encoded).unwrap();
+        let info = parse_manifest(&encoded, PlaybackQuality::HiResLossless).unwrap();
+        assert_eq!(info.quality(), PlaybackQuality::HiResLossless);
+        assert_eq!(info.output_path(), OutputPath::DashRemux);
         match info {
             DownloadInfo::Segmented {
                 initialization_url,
@@ -944,6 +1200,7 @@ mod tests {
                 start_number,
                 segment_count,
                 extension,
+                ..
             } => {
                 assert_eq!(
                     initialization_url,
@@ -955,7 +1212,7 @@ mod tests {
                 );
                 assert_eq!(start_number, 3);
                 assert_eq!(segment_count, 4);
-                assert_eq!(extension, "m4a");
+                assert_eq!(extension, "flac");
             }
             DownloadInfo::Direct { .. } => panic!("expected segmented download info"),
         }
@@ -983,7 +1240,9 @@ mod tests {
         "#;
         let encoded = STANDARD.encode(xml);
 
-        let info = parse_manifest(&encoded).unwrap();
+        let info = parse_manifest(&encoded, PlaybackQuality::HiResLossless).unwrap();
+        assert_eq!(info.quality(), PlaybackQuality::HiResLossless);
+        assert_eq!(info.output_path(), OutputPath::DashRemux);
         match info {
             DownloadInfo::Segmented {
                 initialization_url,
@@ -991,6 +1250,7 @@ mod tests {
                 start_number,
                 segment_count,
                 extension,
+                ..
             } => {
                 assert_eq!(
                     initialization_url,
@@ -1002,7 +1262,7 @@ mod tests {
                 );
                 assert_eq!(start_number, 7);
                 assert_eq!(segment_count, 2);
-                assert_eq!(extension, "m4a");
+                assert_eq!(extension, "flac");
             }
             DownloadInfo::Direct { .. } => panic!("expected segmented download info"),
         }

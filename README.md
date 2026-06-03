@@ -4,6 +4,8 @@ A small Rust CLI for downloading TIDAL tracks, albums, and playlists.
 
 Linux only now.
 
+Requires `ffmpeg` and `ffprobe` on `PATH` to produce native `.flac` files from all stream formats.
+
 ## Usage
 
 Log in first:

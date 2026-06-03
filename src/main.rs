@@ -4,6 +4,7 @@ compile_error!("tidaload currently supports Linux only");
 mod config;
 mod doh;
 mod download;
+mod http;
 mod tidal;
 
 use std::collections::HashMap;
@@ -15,7 +16,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::stream::{self, StreamExt};
-use mp4ameta::{Img, Tag};
+use metaflac::Tag as FlacTag;
+use metaflac::block::PictureType;
+use mp4ameta::{Img, Tag as Mp4Tag};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::time::sleep;
 
@@ -24,17 +27,20 @@ use crate::config::{
     music_download_dir,
 };
 use crate::download::{
-    DownloadProgress, ProgressCallback, SegmentedDownload, download_segmented_to_file,
-    download_to_file, remove_existing_path, sanitize_file_name,
+    DownloadProgress, ProgressCallback, SegmentedDownload, download_direct_to_flac_file,
+    download_segmented_to_file, download_to_file, remove_existing_path, sanitize_file_name,
 };
+use crate::http::{HTTP_SHORT_REQUEST_TIMEOUT, send_bytes_with_retries};
 use crate::tidal::{
-    Album, DownloadInfo, ParsedResource, Playlist, ResourceKind, TidalClient, Track,
-    cover_image_url, parse_resource,
+    Album, DownloadInfo, ParsedResource, PlaybackQuality, Playlist, ResourceKind, TidalClient,
+    Track, cover_image_url, parse_resource,
 };
 
 type CoverCache = Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>;
 const TRACK_START_DELAY_MIN_MS: u64 = 2_000;
 const TRACK_START_DELAY_MAX_MS: u64 = 6_000;
+const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
+const ANSI_RESET: &str = "\x1b[0m";
 
 #[derive(Debug, Parser)]
 #[command(name = "tidaload")]
@@ -395,6 +401,7 @@ async fn download_track(
         .get_download_info(&track.id)
         .await
         .with_context(|| format!("failed to get playback info for {}", track.id))?;
+    print_playback_selection(progress_scope, &info);
 
     let filename = track_filename(&track, info.extension(), options.playlist_position);
     let target_folder = if options.disc_subdirectories {
@@ -416,9 +423,24 @@ async fn download_track(
         DownloadInfo::Direct {
             url,
             encryption_key,
+            native_flac,
+            ..
+        } if *native_flac => {
+            download_to_file(
+                client.http_client(),
+                url,
+                &path,
+                encryption_key.as_deref(),
+                Some(Arc::clone(&progress_callback)),
+            )
+            .await
+        }
+        DownloadInfo::Direct {
+            url,
+            encryption_key,
             ..
         } => {
-            download_to_file(
+            download_direct_to_flac_file(
                 client.http_client(),
                 url,
                 &path,
@@ -471,6 +493,12 @@ fn track_progress_callback(progress_scope: TrackProgressScope, track: &Track) ->
                     .unwrap_or_default()
             );
         }
+        DownloadProgress::DirectEncodingFlac => {
+            println!("{label} {title}: encoding source audio to native FLAC");
+        }
+        DownloadProgress::DirectEncodedFlac => {
+            println!("{label} {title}: encoded to native FLAC");
+        }
         DownloadProgress::DashInitialized => {
             println!("{label} {title}: DASH initialization downloaded");
         }
@@ -479,7 +507,42 @@ fn track_progress_callback(progress_scope: TrackProgressScope, track: &Track) ->
                 println!("{label} {title}: DASH segments {downloaded}/{total}");
             }
         }
+        DownloadProgress::DashRemuxing => {
+            println!("{label} {title}: remuxing DASH FLAC to native FLAC");
+        }
+        DownloadProgress::DashRemuxed { stream_copy } => {
+            if stream_copy {
+                println!("{label} {title}: remuxed to native FLAC");
+            } else {
+                println!("{label} {title}: encoded to native FLAC");
+            }
+        }
     })
+}
+
+fn print_playback_selection(progress_scope: TrackProgressScope, info: &DownloadInfo) {
+    println!(
+        "{}",
+        green_bold(&format!(
+            "{} [FLAC PATH] {}; output: {}",
+            progress_scope.label(),
+            quality_selection_label(info.quality()),
+            info.output_path().label()
+        ))
+    );
+}
+
+fn quality_selection_label(quality: PlaybackQuality) -> &'static str {
+    match quality {
+        PlaybackQuality::HiResLossless => {
+            "quality: tried HI_RES_LOSSLESS -> selected HI_RES_LOSSLESS"
+        }
+        PlaybackQuality::Lossless => "quality: tried HI_RES_LOSSLESS -> fallback selected LOSSLESS",
+    }
+}
+
+fn green_bold(value: &str) -> String {
+    format!("{ANSI_BOLD_GREEN}{value}{ANSI_RESET}")
 }
 
 fn should_log_dash_segment_progress(downloaded: u32, total: u32) -> bool {
@@ -499,16 +562,38 @@ async fn embed_cover_art(
     let cover = cover_art_bytes(client, cover_uuid, cover_cache).await?;
     let path = path.to_path_buf();
 
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut tag = Tag::read_from_path(&path)
-            .with_context(|| format!("failed to read MP4 metadata from {}", path.display()))?;
-        tag.set_artwork(Img::jpeg(cover.as_ref().clone()));
-        tag.write_to_path(&path)
-            .with_context(|| format!("failed to write MP4 metadata to {}", path.display()))?;
-        Ok(())
-    })
-    .await
-    .context("cover art metadata writer task failed")?
+    tokio::task::spawn_blocking(move || embed_cover_art_for_path(&path, cover.as_ref().clone()))
+        .await
+        .context("cover art metadata writer task failed")?
+}
+
+fn embed_cover_art_for_path(path: &Path, cover: Vec<u8>) -> Result<()> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("flac") => embed_flac_cover_art(path, cover),
+        Some("m4a" | "mp4") => embed_mp4_cover_art(path, cover),
+        _ => Ok(()),
+    }
+}
+
+fn embed_flac_cover_art(path: &Path, cover: Vec<u8>) -> Result<()> {
+    let mut tag = FlacTag::read_from_path(path)
+        .with_context(|| format!("failed to read FLAC metadata from {}", path.display()))?;
+    tag.add_picture("image/jpeg", PictureType::CoverFront, cover);
+    tag.save()
+        .with_context(|| format!("failed to write FLAC metadata to {}", path.display()))
+}
+
+fn embed_mp4_cover_art(path: &Path, cover: Vec<u8>) -> Result<()> {
+    let mut tag = Mp4Tag::read_from_path(path)
+        .with_context(|| format!("failed to read MP4 metadata from {}", path.display()))?;
+    tag.set_artwork(Img::jpeg(cover));
+    tag.write_to_path(path)
+        .with_context(|| format!("failed to write MP4 metadata to {}", path.display()))
 }
 
 async fn cover_art_bytes(
@@ -524,17 +609,14 @@ async fn cover_art_bytes(
     }
 
     let url = cover_image_url(cover_uuid);
-    let cover = client
-        .get(&url)
-        .send()
+    let cover = client.get(&url).timeout(HTTP_SHORT_REQUEST_TIMEOUT);
+    let cover = send_bytes_with_retries(cover)
         .await
-        .with_context(|| format!("failed to request cover art {url}"))?
-        .error_for_status()
-        .with_context(|| format!("cover art request failed for {url}"))?
-        .bytes()
-        .await
-        .with_context(|| format!("failed to read cover art {url}"))?;
-    let cover = Arc::new(cover.to_vec());
+        .with_context(|| format!("failed to request cover art {url}"))?;
+    if !cover.status.is_success() {
+        bail!("cover art request failed for {url}: {}", cover.status);
+    }
+    let cover = Arc::new(cover.body);
 
     let mut cache = cover_cache.lock().await;
     Ok(Arc::clone(
