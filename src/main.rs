@@ -41,7 +41,9 @@ type CoverCell = Arc<OnceCell<CoverBytes>>;
 type CoverCache = Arc<Mutex<HashMap<String, CoverCell>>>;
 const TRACK_START_DELAY_MIN_MS: u64 = 2_000;
 const TRACK_START_DELAY_MAX_MS: u64 = 6_000;
+const TRACK_DOWNLOAD_MAX_ATTEMPTS: usize = 2;
 const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
+const ANSI_BOLD_RED: &str = "\x1b[1;31m";
 const ANSI_RESET: &str = "\x1b[0m";
 
 #[derive(Debug, Parser)]
@@ -258,14 +260,24 @@ async fn download_tracks_concurrently(
     let completed_tracks = Arc::new(AtomicUsize::new(0));
     let total_tracks = tracks.len();
 
-    let results: Vec<Result<()>> = stream::iter(tracks.into_iter().enumerate())
+    let results: Vec<Option<MissingTrack>> = stream::iter(tracks.into_iter().enumerate())
         .map(|(index, track)| {
             let semaphore = Arc::clone(&semaphore);
             let cover_cache = Arc::clone(&cover_cache);
             let completed_tracks = Arc::clone(&completed_tracks);
             let folder = folder.clone();
             async move {
-                let _permit = semaphore.acquire_owned().await?;
+                let _permit = match semaphore.acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(err) => {
+                        return Some(MissingTrack::from_track(
+                            index,
+                            total_tracks,
+                            &track,
+                            format!("failed to acquire download slot: {err}"),
+                        ));
+                    }
+                };
                 let delay = track_start_delay(index, concurrency);
                 if !delay.is_zero() {
                     println!(
@@ -285,9 +297,9 @@ async fn download_tracks_concurrently(
                     } => disc_subdirectories,
                     TrackNumbering::Playlist => false,
                 };
-                let result = download_track(
+                let result = download_track_with_retries(
                     client,
-                    track,
+                    &track,
                     &folder,
                     &cover_cache,
                     TrackDownloadOptions {
@@ -303,30 +315,38 @@ async fn download_tracks_concurrently(
                 .await;
 
                 let finished = completed_tracks.fetch_add(1, Ordering::SeqCst) + 1;
-                match &result {
-                    Ok(()) => println!("[global {finished}/{total_tracks}] Track complete"),
+                match result {
+                    Ok(TrackDownloadStatus::Saved) => {
+                        println!("[global {finished}/{total_tracks}] Track complete");
+                        None
+                    }
+                    Ok(TrackDownloadStatus::SkippedUnavailable) => {
+                        eprintln!("[global {finished}/{total_tracks}] Track skipped");
+                        Some(MissingTrack::from_track(
+                            index,
+                            total_tracks,
+                            &track,
+                            "unavailable for streaming",
+                        ))
+                    }
                     Err(err) => {
-                        eprintln!("[global {finished}/{total_tracks}] Track failed: {err:#}")
+                        eprintln!("[global {finished}/{total_tracks}] Track failed: {err:#}");
+                        Some(MissingTrack::from_track(
+                            index,
+                            total_tracks,
+                            &track,
+                            format!("{err:#}"),
+                        ))
                     }
                 }
-                result
             }
         })
         .buffer_unordered(concurrency)
         .collect()
         .await;
 
-    let mut failures = 0;
-    for result in results {
-        if let Err(err) = result {
-            failures += 1;
-            eprintln!("download failed: {err:#}");
-        }
-    }
-
-    if failures > 0 {
-        bail!("{failures} track download(s) failed");
-    }
+    let missing_tracks: Vec<_> = results.into_iter().flatten().collect();
+    print_missing_tracks(&missing_tracks);
 
     Ok(())
 }
@@ -338,9 +358,9 @@ async fn download_single_track(
     folder: &Path,
 ) -> Result<()> {
     let cover_cache = Arc::new(Mutex::new(HashMap::new()));
-    download_track(
+    match download_track_with_retries(
         client,
-        track,
+        &track,
         folder,
         &cover_cache,
         TrackDownloadOptions {
@@ -350,8 +370,19 @@ async fn download_single_track(
             progress_scope: TrackProgressScope { index: 1, total: 1 },
         },
     )
-    .await?;
-    println!("[global 1/1] Track complete");
+    .await?
+    {
+        TrackDownloadStatus::Saved => println!("[global 1/1] Track complete"),
+        TrackDownloadStatus::SkippedUnavailable => {
+            eprintln!(
+                "{}",
+                red_bold(&format!(
+                    "Missing track: {} - {} [{}] - unavailable for streaming",
+                    track.artist, track.title, track.id
+                ))
+            );
+        }
+    }
     Ok(())
 }
 
@@ -369,19 +400,74 @@ struct TrackDownloadOptions {
     progress_scope: TrackProgressScope,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackDownloadStatus {
+    Saved,
+    SkippedUnavailable,
+}
+
+#[derive(Debug)]
+struct MissingTrack {
+    index: usize,
+    total: usize,
+    id: String,
+    artist: String,
+    title: String,
+    reason: String,
+}
+
 impl TrackProgressScope {
     fn label(self) -> String {
         track_scope(self.index.saturating_sub(1), self.total)
     }
 }
 
-async fn download_track(
+impl MissingTrack {
+    fn from_track(index: usize, total: usize, track: &Track, reason: impl Into<String>) -> Self {
+        Self {
+            index,
+            total,
+            id: track.id.clone(),
+            artist: track.artist.clone(),
+            title: track.title.clone(),
+            reason: reason.into(),
+        }
+    }
+}
+
+async fn download_track_with_retries(
     client: &TidalClient,
-    track: Track,
+    track: &Track,
     folder: &Path,
     cover_cache: &CoverCache,
     options: TrackDownloadOptions,
-) -> Result<()> {
+) -> Result<TrackDownloadStatus> {
+    let mut attempt = 1usize;
+    loop {
+        match download_track(client, track, folder, cover_cache, options).await {
+            Ok(status) => return Ok(status),
+            Err(err) if attempt < TRACK_DOWNLOAD_MAX_ATTEMPTS => {
+                eprintln!(
+                    "{} Retrying track after failure (attempt {}/{}): {err:#}",
+                    options.progress_scope.label(),
+                    attempt + 1,
+                    TRACK_DOWNLOAD_MAX_ATTEMPTS
+                );
+                crate::http::sleep_before_retry(attempt).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn download_track(
+    client: &TidalClient,
+    track: &Track,
+    folder: &Path,
+    cover_cache: &CoverCache,
+    options: TrackDownloadOptions,
+) -> Result<TrackDownloadStatus> {
     let progress_scope = options.progress_scope;
     if !track.allow_streaming {
         println!(
@@ -390,7 +476,7 @@ async fn download_track(
             track.title,
             track.id
         );
-        return Ok(());
+        return Ok(TrackDownloadStatus::SkippedUnavailable);
     }
 
     println!(
@@ -482,7 +568,7 @@ async fn download_track(
         );
     }
     println!("{} Saved: {}", progress_scope.label(), path.display());
-    Ok(())
+    Ok(TrackDownloadStatus::Saved)
 }
 
 fn track_progress_callback(progress_scope: TrackProgressScope, track: &Track) -> ProgressCallback {
@@ -549,6 +635,35 @@ fn quality_selection_label(quality: PlaybackQuality) -> &'static str {
 
 fn green_bold(value: &str) -> String {
     format!("{ANSI_BOLD_GREEN}{value}{ANSI_RESET}")
+}
+
+fn red_bold(value: &str) -> String {
+    format!("{ANSI_BOLD_RED}{value}{ANSI_RESET}")
+}
+
+fn print_missing_tracks(missing_tracks: &[MissingTrack]) {
+    if missing_tracks.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "{}",
+        red_bold(&format!("Missing {} track(s):", missing_tracks.len()))
+    );
+    for missing_track in missing_tracks {
+        eprintln!("{}", red_bold(&format_missing_track(missing_track)));
+    }
+}
+
+fn format_missing_track(missing_track: &MissingTrack) -> String {
+    format!(
+        "  {} {} - {} [{}] - {}",
+        track_scope(missing_track.index, missing_track.total),
+        missing_track.artist,
+        missing_track.title,
+        missing_track.id,
+        missing_track.reason
+    )
 }
 
 fn should_log_dash_segment_progress(downloaded: u32, total: u32) -> bool {
@@ -719,6 +834,28 @@ mod tests {
         assert!(should_log_dash_segment_progress(8, 32));
         assert!(should_log_dash_segment_progress(32, 32));
         assert!(!should_log_dash_segment_progress(7, 32));
+    }
+
+    #[test]
+    fn formats_missing_track_summary_line() {
+        let missing_track = MissingTrack {
+            index: 2,
+            total: 12,
+            id: "42".to_string(),
+            artist: "Artist".to_string(),
+            title: "Title".to_string(),
+            reason: "network timeout".to_string(),
+        };
+
+        assert_eq!(
+            format_missing_track(&missing_track),
+            "  [3/12] Artist - Title [42] - network timeout"
+        );
+    }
+
+    #[test]
+    fn wraps_text_in_bold_red() {
+        assert_eq!(red_bold("missing"), "\x1b[1;31mmissing\x1b[0m");
     }
 
     #[test]
