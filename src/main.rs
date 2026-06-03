@@ -520,7 +520,7 @@ async fn download_track(
         .with_context(|| format!("failed to get playback info for {}", track.id))?;
     print_playback_selection(progress_scope, &info);
 
-    let filename = track_filename(&track, info.extension(), options.playlist_position);
+    let filename = track_filename(track, info.extension(), options.playlist_position);
     let target_folder = if options.disc_subdirectories {
         folder.join(format!("Disc {}", track.volume_number.unwrap_or(1)))
     } else {
@@ -535,7 +535,7 @@ async fn download_track(
         track.artist,
         track.title
     );
-    let progress_callback = track_progress_callback(progress_scope, &track);
+    let progress_callback = track_progress_callback(progress_scope, track);
     match &info {
         DownloadInfo::Direct {
             url,
