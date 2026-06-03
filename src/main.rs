@@ -19,7 +19,7 @@ use futures_util::stream::{self, StreamExt};
 use metaflac::Tag as FlacTag;
 use metaflac::block::PictureType;
 use mp4ameta::{Img, Tag as Mp4Tag};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OnceCell, Semaphore};
 use tokio::time::sleep;
 
 use crate::config::{
@@ -36,7 +36,9 @@ use crate::tidal::{
     Track, cover_image_url, parse_resource,
 };
 
-type CoverCache = Arc<Mutex<HashMap<String, Arc<Vec<u8>>>>>;
+type CoverBytes = Arc<Vec<u8>>;
+type CoverCell = Arc<OnceCell<CoverBytes>>;
+type CoverCache = Arc<Mutex<HashMap<String, CoverCell>>>;
 const TRACK_START_DELAY_MIN_MS: u64 = 2_000;
 const TRACK_START_DELAY_MAX_MS: u64 = 6_000;
 const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
@@ -472,9 +474,13 @@ async fn download_track(
         }
     }
     .with_context(|| format!("failed to download {}", track.id))?;
-    embed_cover_art(client.http_client(), &track, &path, cover_cache)
-        .await
-        .with_context(|| format!("failed to embed cover art for {}", track.id))?;
+    if let Err(err) = embed_cover_art(client.http_client(), &track, &path, cover_cache).await {
+        eprintln!(
+            "{} Cover art skipped for {}: {err:#}",
+            progress_scope.label(),
+            track.id
+        );
+    }
     println!("{} Saved: {}", progress_scope.label(), path.display());
     Ok(())
 }
@@ -601,13 +607,27 @@ async fn cover_art_bytes(
     cover_uuid: &str,
     cover_cache: &CoverCache,
 ) -> Result<Arc<Vec<u8>>> {
-    {
-        let cache = cover_cache.lock().await;
-        if let Some(cover) = cache.get(cover_uuid) {
-            return Ok(Arc::clone(cover));
-        }
-    }
+    let cover_cell = {
+        let mut cache = cover_cache.lock().await;
+        Arc::clone(
+            cache
+                .entry(cover_uuid.to_string())
+                .or_insert_with(|| Arc::new(OnceCell::new())),
+        )
+    };
 
+    let cover_uuid = cover_uuid.to_string();
+    let cover = cover_cell
+        .get_or_try_init(|| async {
+            download_cover_art_bytes(client, &cover_uuid)
+                .await
+                .map(Arc::new)
+        })
+        .await?;
+    Ok(Arc::clone(cover))
+}
+
+async fn download_cover_art_bytes(client: &reqwest::Client, cover_uuid: &str) -> Result<Vec<u8>> {
     let url = cover_image_url(cover_uuid);
     let cover = client.get(&url).timeout(HTTP_SHORT_REQUEST_TIMEOUT);
     let cover = send_bytes_with_retries(cover)
@@ -616,14 +636,7 @@ async fn cover_art_bytes(
     if !cover.status.is_success() {
         bail!("cover art request failed for {url}: {}", cover.status);
     }
-    let cover = Arc::new(cover.body);
-
-    let mut cache = cover_cache.lock().await;
-    Ok(Arc::clone(
-        cache
-            .entry(cover_uuid.to_string())
-            .or_insert_with(|| Arc::clone(&cover)),
-    ))
+    Ok(cover.body)
 }
 
 fn track_filename(track: &Track, extension: &str, playlist_position: Option<usize>) -> String {
