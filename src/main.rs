@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::stream::{self, StreamExt};
 use metaflac::Tag as FlacTag;
-use metaflac::block::PictureType;
+use metaflac::block::{BlockType, PictureType};
 use mp4ameta::{Img, Tag as Mp4Tag};
 use tokio::sync::{Mutex, OnceCell, Semaphore};
 use tokio::time::sleep;
@@ -202,6 +202,7 @@ async fn download_album(
         album.artist, album.title, year
     )));
     let disc_subdirectories = album.disc_total > 1;
+    let tag_context = TrackTagContext::album(&album);
     remove_existing_path(&folder).await?;
     download_tracks_concurrently(
         client,
@@ -211,6 +212,7 @@ async fn download_album(
         TrackNumbering::Album {
             disc_subdirectories,
         },
+        tag_context,
     )
     .await
 }
@@ -236,6 +238,7 @@ async fn download_playlist(
         playlist.tracks,
         folder,
         TrackNumbering::Playlist,
+        TrackTagContext::default(),
     )
     .await
 }
@@ -252,6 +255,7 @@ async fn download_tracks_concurrently(
     tracks: Vec<Track>,
     folder: PathBuf,
     numbering: TrackNumbering,
+    tag_context: TrackTagContext,
 ) -> Result<()> {
     let concurrency = config.downloads.concurrency.max(1);
     let dash_segment_concurrency = config.downloads.dash_segment_concurrency.max(1);
@@ -266,6 +270,7 @@ async fn download_tracks_concurrently(
             let cover_cache = Arc::clone(&cover_cache);
             let completed_tracks = Arc::clone(&completed_tracks);
             let folder = folder.clone();
+            let tag_context = tag_context.clone();
             async move {
                 let _permit = match semaphore.acquire_owned().await {
                     Ok(permit) => permit,
@@ -310,6 +315,7 @@ async fn download_tracks_concurrently(
                             index: index + 1,
                             total: total_tracks,
                         },
+                        tag_context,
                     },
                 )
                 .await;
@@ -368,6 +374,7 @@ async fn download_single_track(
             disc_subdirectories: false,
             dash_segment_concurrency: config.downloads.dash_segment_concurrency,
             progress_scope: TrackProgressScope { index: 1, total: 1 },
+            tag_context: TrackTagContext::default(),
         },
     )
     .await?
@@ -392,12 +399,22 @@ struct TrackProgressScope {
     total: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TrackDownloadOptions {
     playlist_position: Option<usize>,
     disc_subdirectories: bool,
     dash_segment_concurrency: usize,
     progress_scope: TrackProgressScope,
+    tag_context: TrackTagContext,
+}
+
+#[derive(Debug, Default, Clone)]
+struct TrackTagContext {
+    album_title: Option<String>,
+    album_artist: Option<String>,
+    album_year: Option<String>,
+    track_total: Option<u64>,
+    disc_total: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -435,6 +452,18 @@ impl MissingTrack {
     }
 }
 
+impl TrackTagContext {
+    fn album(album: &Album) -> Self {
+        Self {
+            album_title: Some(album.title.clone()),
+            album_artist: Some(album.artist.clone()),
+            album_year: album.year.clone(),
+            track_total: Some(album.tracks.len() as u64),
+            disc_total: Some(album.disc_total),
+        }
+    }
+}
+
 async fn download_track_with_retries(
     client: &TidalClient,
     track: &Track,
@@ -444,7 +473,7 @@ async fn download_track_with_retries(
 ) -> Result<TrackDownloadStatus> {
     let mut attempt = 1usize;
     loop {
-        match download_track(client, track, folder, cover_cache, options).await {
+        match download_track(client, track, folder, cover_cache, options.clone()).await {
             Ok(status) => return Ok(status),
             Err(err) if attempt < TRACK_DOWNLOAD_MAX_ATTEMPTS => {
                 eprintln!(
@@ -560,9 +589,18 @@ async fn download_track(
         }
     }
     .with_context(|| format!("failed to download {}", track.id))?;
-    if let Err(err) = embed_cover_art(client.http_client(), &track, &path, cover_cache).await {
+    if let Err(err) = write_track_metadata(
+        client.http_client(),
+        track,
+        &path,
+        cover_cache,
+        &options.tag_context,
+        progress_scope,
+    )
+    .await
+    {
         eprintln!(
-            "{} Cover art skipped for {}: {err:#}",
+            "{} Metadata skipped for {}: {err:#}",
             progress_scope.label(),
             track.id
         );
@@ -670,51 +708,199 @@ fn should_log_dash_segment_progress(downloaded: u32, total: u32) -> bool {
     downloaded == 1 || downloaded == total || downloaded.is_multiple_of(8)
 }
 
-async fn embed_cover_art(
+#[derive(Debug, Clone)]
+struct TrackMetadata {
+    title: String,
+    artist: String,
+    album: Option<String>,
+    album_artist: Option<String>,
+    year: Option<String>,
+    track_number: Option<u64>,
+    track_total: Option<u64>,
+    disc_number: Option<u64>,
+    disc_total: Option<u64>,
+    cover_uuid: Option<String>,
+}
+
+impl TrackMetadata {
+    fn from_track(track: &Track, context: &TrackTagContext) -> Self {
+        let album = context
+            .album_title
+            .clone()
+            .or_else(|| track.album_title.clone());
+        let album_artist = context
+            .album_artist
+            .clone()
+            .or_else(|| track.album_artist.clone())
+            .or_else(|| Some(track.artist.clone()));
+
+        Self {
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            album,
+            album_artist,
+            year: context
+                .album_year
+                .clone()
+                .or_else(|| track.album_year.clone()),
+            track_number: track.track_number,
+            track_total: context.track_total.or(track.album_track_total),
+            disc_number: track.volume_number,
+            disc_total: context.disc_total.or(track.album_disc_total),
+            cover_uuid: track.cover_uuid.clone(),
+        }
+    }
+}
+
+async fn write_track_metadata(
     client: &reqwest::Client,
     track: &Track,
     path: &Path,
     cover_cache: &CoverCache,
+    context: &TrackTagContext,
+    progress_scope: TrackProgressScope,
 ) -> Result<()> {
-    let Some(cover_uuid) = track.cover_uuid.as_deref() else {
-        return Ok(());
+    let metadata = TrackMetadata::from_track(track, context);
+    let cover = if let Some(cover_uuid) = metadata.cover_uuid.as_deref() {
+        match cover_art_bytes(client, cover_uuid, cover_cache).await {
+            Ok(cover) => Some(cover.as_ref().clone()),
+            Err(err) => {
+                eprintln!(
+                    "{} Cover art skipped for {}: {err:#}",
+                    progress_scope.label(),
+                    track.id
+                );
+                None
+            }
+        }
+    } else {
+        None
     };
 
-    let cover = cover_art_bytes(client, cover_uuid, cover_cache).await?;
     let path = path.to_path_buf();
 
-    tokio::task::spawn_blocking(move || embed_cover_art_for_path(&path, cover.as_ref().clone()))
+    tokio::task::spawn_blocking(move || write_track_metadata_for_path(&path, &metadata, cover))
         .await
-        .context("cover art metadata writer task failed")?
+        .context("track metadata writer task failed")?
 }
 
-fn embed_cover_art_for_path(path: &Path, cover: Vec<u8>) -> Result<()> {
+fn write_track_metadata_for_path(
+    path: &Path,
+    metadata: &TrackMetadata,
+    cover: Option<Vec<u8>>,
+) -> Result<()> {
     match path
         .extension()
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("flac") => embed_flac_cover_art(path, cover),
-        Some("m4a" | "mp4") => embed_mp4_cover_art(path, cover),
+        Some("flac") => write_flac_metadata(path, metadata, cover),
+        Some("m4a" | "mp4") => write_mp4_metadata(path, metadata, cover),
         _ => Ok(()),
     }
 }
 
-fn embed_flac_cover_art(path: &Path, cover: Vec<u8>) -> Result<()> {
+fn write_flac_metadata(
+    path: &Path,
+    metadata: &TrackMetadata,
+    cover: Option<Vec<u8>>,
+) -> Result<()> {
     let mut tag = FlacTag::read_from_path(path)
         .with_context(|| format!("failed to read FLAC metadata from {}", path.display()))?;
-    tag.add_picture("image/jpeg", PictureType::CoverFront, cover);
+    apply_flac_metadata(&mut tag, metadata, cover);
     tag.save()
         .with_context(|| format!("failed to write FLAC metadata to {}", path.display()))
 }
 
-fn embed_mp4_cover_art(path: &Path, cover: Vec<u8>) -> Result<()> {
+fn apply_flac_metadata(tag: &mut FlacTag, metadata: &TrackMetadata, cover: Option<Vec<u8>>) {
+    set_flac_vorbis(tag, "TITLE", Some(metadata.title.as_str()));
+    set_flac_vorbis(tag, "ARTIST", Some(metadata.artist.as_str()));
+    set_flac_vorbis(tag, "ALBUM", metadata.album.as_deref());
+    set_flac_vorbis(tag, "ALBUMARTIST", metadata.album_artist.as_deref());
+    set_flac_vorbis(tag, "ALBUM ARTIST", metadata.album_artist.as_deref());
+    set_flac_vorbis(tag, "DATE", metadata.year.as_deref());
+    set_flac_vorbis(tag, "YEAR", metadata.year.as_deref());
+    set_flac_vorbis_string(tag, "TRACKNUMBER", metadata.track_number);
+    set_flac_vorbis_string(tag, "TRACKTOTAL", metadata.track_total);
+    set_flac_vorbis_string(tag, "TOTALTRACKS", metadata.track_total);
+    set_flac_vorbis_string(tag, "DISCNUMBER", metadata.disc_number);
+    set_flac_vorbis_string(tag, "DISCTOTAL", metadata.disc_total);
+    set_flac_vorbis_string(tag, "TOTALDISCS", metadata.disc_total);
+
+    if let Some(cover) = cover {
+        tag.remove_blocks(BlockType::Picture);
+        tag.add_picture("image/jpeg", PictureType::CoverFront, cover);
+    }
+}
+
+fn set_flac_vorbis(tag: &mut FlacTag, key: &str, value: Option<&str>) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        tag.set_vorbis(key, vec![value]);
+    } else {
+        tag.remove_vorbis(key);
+    }
+}
+
+fn set_flac_vorbis_string(tag: &mut FlacTag, key: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        tag.set_vorbis(key, vec![value.to_string()]);
+    } else {
+        tag.remove_vorbis(key);
+    }
+}
+
+fn write_mp4_metadata(path: &Path, metadata: &TrackMetadata, cover: Option<Vec<u8>>) -> Result<()> {
     let mut tag = Mp4Tag::read_from_path(path)
         .with_context(|| format!("failed to read MP4 metadata from {}", path.display()))?;
-    tag.set_artwork(Img::jpeg(cover));
+    tag.set_title(metadata.title.clone());
+    tag.set_artist(metadata.artist.clone());
+    if let Some(album) = metadata.album.as_deref() {
+        tag.set_album(album);
+    } else {
+        tag.remove_album();
+    }
+    if let Some(album_artist) = metadata.album_artist.as_deref() {
+        tag.set_album_artist(album_artist);
+    } else {
+        tag.remove_album_artists();
+    }
+    if let Some(year) = metadata.year.as_deref() {
+        tag.set_year(year);
+    } else {
+        tag.remove_year();
+    }
+    set_mp4_track(&mut tag, metadata.track_number, metadata.track_total);
+    set_mp4_disc(&mut tag, metadata.disc_number, metadata.disc_total);
+
+    if let Some(cover) = cover {
+        tag.set_artwork(Img::jpeg(cover));
+    }
+
     tag.write_to_path(path)
         .with_context(|| format!("failed to write MP4 metadata to {}", path.display()))
+}
+
+fn set_mp4_track(tag: &mut Mp4Tag, track_number: Option<u64>, track_total: Option<u64>) {
+    match (u64_to_u16(track_number), u64_to_u16(track_total)) {
+        (Some(track_number), Some(track_total)) => tag.set_track(track_number, track_total),
+        (Some(track_number), None) => tag.set_track_number(track_number),
+        (None, Some(track_total)) => tag.set_total_tracks(track_total),
+        (None, None) => tag.remove_track(),
+    }
+}
+
+fn set_mp4_disc(tag: &mut Mp4Tag, disc_number: Option<u64>, disc_total: Option<u64>) {
+    match (u64_to_u16(disc_number), u64_to_u16(disc_total)) {
+        (Some(disc_number), Some(disc_total)) => tag.set_disc(disc_number, disc_total),
+        (Some(disc_number), None) => tag.set_disc_number(disc_number),
+        (None, Some(disc_total)) => tag.set_total_discs(disc_total),
+        (None, None) => tag.remove_disc(),
+    }
+}
+
+fn u64_to_u16(value: Option<u64>) -> Option<u16> {
+    value.and_then(|value| u16::try_from(value).ok())
 }
 
 async fn cover_art_bytes(
@@ -856,6 +1042,81 @@ mod tests {
     #[test]
     fn wraps_text_in_bold_red() {
         assert_eq!(red_bold("missing"), "\x1b[1;31mmissing\x1b[0m");
+    }
+
+    #[test]
+    fn track_metadata_prefers_album_context() {
+        let track = Track {
+            id: "42".to_string(),
+            title: "Track".to_string(),
+            artist: "Track Artist".to_string(),
+            album_title: Some("Original Album".to_string()),
+            album_artist: Some("Original Album Artist".to_string()),
+            album_year: Some("2020".to_string()),
+            album_track_total: Some(10),
+            album_disc_total: Some(1),
+            track_number: Some(3),
+            volume_number: Some(2),
+            cover_uuid: Some("abcd-efgh".to_string()),
+            allow_streaming: true,
+        };
+        let context = TrackTagContext {
+            album_title: Some("Context Album".to_string()),
+            album_artist: Some("Context Artist".to_string()),
+            album_year: Some("2024".to_string()),
+            track_total: Some(12),
+            disc_total: Some(2),
+        };
+
+        let metadata = TrackMetadata::from_track(&track, &context);
+
+        assert_eq!(metadata.title, "Track");
+        assert_eq!(metadata.artist, "Track Artist");
+        assert_eq!(metadata.album.as_deref(), Some("Context Album"));
+        assert_eq!(metadata.album_artist.as_deref(), Some("Context Artist"));
+        assert_eq!(metadata.year.as_deref(), Some("2024"));
+        assert_eq!(metadata.track_number, Some(3));
+        assert_eq!(metadata.track_total, Some(12));
+        assert_eq!(metadata.disc_number, Some(2));
+        assert_eq!(metadata.disc_total, Some(2));
+        assert_eq!(metadata.cover_uuid.as_deref(), Some("abcd-efgh"));
+    }
+
+    #[test]
+    fn applies_flac_metadata_with_player_compatibility_aliases() {
+        let metadata = TrackMetadata {
+            title: "Track".to_string(),
+            artist: "Track Artist".to_string(),
+            album: Some("Album".to_string()),
+            album_artist: Some("Album Artist".to_string()),
+            year: Some("2024".to_string()),
+            track_number: Some(3),
+            track_total: Some(12),
+            disc_number: Some(1),
+            disc_total: Some(2),
+            cover_uuid: None,
+        };
+        let mut tag = FlacTag::new();
+
+        apply_flac_metadata(&mut tag, &metadata, None);
+
+        assert_eq!(single_vorbis(&tag, "TITLE"), Some("Track"));
+        assert_eq!(single_vorbis(&tag, "ARTIST"), Some("Track Artist"));
+        assert_eq!(single_vorbis(&tag, "ALBUM"), Some("Album"));
+        assert_eq!(single_vorbis(&tag, "ALBUMARTIST"), Some("Album Artist"));
+        assert_eq!(single_vorbis(&tag, "ALBUM ARTIST"), Some("Album Artist"));
+        assert_eq!(single_vorbis(&tag, "DATE"), Some("2024"));
+        assert_eq!(single_vorbis(&tag, "YEAR"), Some("2024"));
+        assert_eq!(single_vorbis(&tag, "TRACKNUMBER"), Some("3"));
+        assert_eq!(single_vorbis(&tag, "TRACKTOTAL"), Some("12"));
+        assert_eq!(single_vorbis(&tag, "TOTALTRACKS"), Some("12"));
+        assert_eq!(single_vorbis(&tag, "DISCNUMBER"), Some("1"));
+        assert_eq!(single_vorbis(&tag, "DISCTOTAL"), Some("2"));
+        assert_eq!(single_vorbis(&tag, "TOTALDISCS"), Some("2"));
+    }
+
+    fn single_vorbis<'a>(tag: &'a FlacTag, key: &str) -> Option<&'a str> {
+        tag.get_vorbis(key)?.next()
     }
 
     #[test]

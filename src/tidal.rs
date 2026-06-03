@@ -61,6 +61,11 @@ pub struct Track {
     pub id: String,
     pub title: String,
     pub artist: String,
+    pub album_title: Option<String>,
+    pub album_artist: Option<String>,
+    pub album_year: Option<String>,
+    pub album_track_total: Option<u64>,
+    pub album_disc_total: Option<u64>,
     pub track_number: Option<u64>,
     pub volume_number: Option<u64>,
     pub cover_uuid: Option<String>,
@@ -810,7 +815,7 @@ fn album_from_value(value: &Value) -> Result<Album> {
     let artist = artists(value)
         .or_else(|| nested_string(value, &["artist", "name"]))
         .unwrap_or_else(|| "Unknown Artist".to_string());
-    let year = string_opt(value, "releaseDate").map(|date| date.chars().take(4).collect());
+    let year = string_opt(value, "releaseDate").and_then(|date| year_from_date(&date));
     let album_cover_uuid = string_opt(value, "cover").filter(|cover| !cover.is_empty());
     let tracks = value
         .get("tracks")
@@ -870,6 +875,11 @@ fn track_from_value(value: &Value) -> Track {
         id: id_string(value),
         title,
         artist,
+        album_title: track_album_title(value),
+        album_artist: track_album_artist(value),
+        album_year: track_album_year(value),
+        album_track_total: nested_u64(value, &["album", "numberOfTracks"]),
+        album_disc_total: nested_u64(value, &["album", "numberOfVolumes"]),
         track_number: value.get("trackNumber").and_then(Value::as_u64),
         volume_number: value.get("volumeNumber").and_then(Value::as_u64),
         cover_uuid: track_cover_uuid(value),
@@ -920,6 +930,27 @@ fn artists(value: &Value) -> Option<String> {
     (!names.is_empty()).then(|| names.join(", "))
 }
 
+fn track_album_title(value: &Value) -> Option<String> {
+    nested_string(value, &["album", "title"]).filter(|title| !title.is_empty())
+}
+
+fn track_album_artist(value: &Value) -> Option<String> {
+    nested_value(value, &["album"]).and_then(|album| {
+        artists(album)
+            .or_else(|| nested_string(album, &["artist", "name"]))
+            .filter(|artist| !artist.is_empty())
+    })
+}
+
+fn track_album_year(value: &Value) -> Option<String> {
+    nested_string(value, &["album", "releaseDate"]).and_then(|date| year_from_date(&date))
+}
+
+fn year_from_date(date: &str) -> Option<String> {
+    let year: String = date.chars().take(4).collect();
+    (!year.is_empty()).then_some(year)
+}
+
 fn string_field(value: &Value, field: &str, fallback: &str) -> String {
     string_opt(value, field).unwrap_or_else(|| fallback.to_string())
 }
@@ -932,11 +963,19 @@ fn string_opt(value: &Value, field: &str) -> Option<String> {
 }
 
 fn nested_string(value: &Value, keys: &[&str]) -> Option<String> {
+    nested_value(value, keys)?.as_str().map(ToString::to_string)
+}
+
+fn nested_u64(value: &Value, keys: &[&str]) -> Option<u64> {
+    nested_value(value, keys)?.as_u64()
+}
+
+fn nested_value<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
     let mut current = value;
     for key in keys {
         current = current.get(*key)?;
     }
-    current.as_str().map(ToString::to_string)
+    Some(current)
 }
 
 fn track_cover_uuid(value: &Value) -> Option<String> {
@@ -1008,11 +1047,23 @@ mod tests {
             "artist": {"name": "Artist"},
             "trackNumber": 7,
             "volumeNumber": 2,
-            "album": {"cover": "abcd-efgh"},
+            "album": {
+                "title": "Album",
+                "artist": {"name": "Album Artist"},
+                "releaseDate": "2024-03-01",
+                "numberOfTracks": 12,
+                "numberOfVolumes": 2,
+                "cover": "abcd-efgh"
+            },
             "allowStreaming": true
         }));
 
         assert_eq!(track.id, "42");
+        assert_eq!(track.album_title.as_deref(), Some("Album"));
+        assert_eq!(track.album_artist.as_deref(), Some("Album Artist"));
+        assert_eq!(track.album_year.as_deref(), Some("2024"));
+        assert_eq!(track.album_track_total, Some(12));
+        assert_eq!(track.album_disc_total, Some(2));
         assert_eq!(track.track_number, Some(7));
         assert_eq!(track.volume_number, Some(2));
         assert_eq!(track.cover_uuid.as_deref(), Some("abcd-efgh"));
