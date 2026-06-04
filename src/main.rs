@@ -30,7 +30,7 @@ use crate::download::{
     DownloadProgress, ProgressCallback, SegmentedDownload, download_direct_to_flac_file,
     download_segmented_to_file, download_to_file, remove_existing_path, sanitize_file_name,
 };
-use crate::http::{HTTP_SHORT_REQUEST_TIMEOUT, send_bytes_with_retries};
+use crate::http::{HTTP_SHORT_REQUEST_TIMEOUT, is_rate_limited_error, send_bytes_with_retries};
 use crate::tidal::{
     Album, DownloadInfo, ParsedResource, PlaybackQuality, Playlist, ResourceKind, TidalClient,
     Track, cover_image_url, parse_resource,
@@ -42,6 +42,7 @@ type CoverCache = Arc<Mutex<HashMap<String, CoverCell>>>;
 const TRACK_START_DELAY_MIN_MS: u64 = 2_000;
 const TRACK_START_DELAY_MAX_MS: u64 = 6_000;
 const TRACK_DOWNLOAD_MAX_ATTEMPTS: usize = 2;
+const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 const ANSI_BOLD_GREEN: &str = "\x1b[1;32m";
 const ANSI_BOLD_RED: &str = "\x1b[1;31m";
 const ANSI_RESET: &str = "\x1b[0m";
@@ -114,6 +115,19 @@ async fn run_download(
     download_dir: Option<PathBuf>,
     items: Vec<String>,
 ) -> Result<()> {
+    if let Some(remaining) =
+        rate_limit_cooldown_remaining(config.downloads.last_429_at, current_time_secs())
+    {
+        eprintln!(
+            "{}",
+            red_bold(&format!(
+                "HTTP 429 cooldown active. Try again in {}.",
+                format_duration(remaining)
+            ))
+        );
+        bail!("TIDAL HTTP 429 cooldown is active");
+    }
+
     if let Some(dash_segment_concurrency) = dash_segment_concurrency {
         config.downloads.dash_segment_concurrency = dash_segment_concurrency.max(1);
     } else if config.downloads.dash_segment_concurrency == 0 {
@@ -138,10 +152,75 @@ async fn run_download(
     )?;
 
     for resource in resources {
-        download_resource(&client, config, resource, &download_root).await?;
+        match download_resource(&client, config, resource, &download_root).await {
+            Ok(()) => {}
+            Err(err) if is_rate_limited_error(&err) => {
+                record_rate_limit_and_warn(config, config_path)?;
+                return Err(err).context("stopped after TIDAL returned HTTP 429");
+            }
+            Err(err) => return Err(err),
+        }
     }
 
     Ok(())
+}
+
+fn record_rate_limit_and_warn(config: &mut Config, config_path: &Path) -> Result<()> {
+    config.downloads.last_429_at = current_time_secs();
+    config.save(config_path).with_context(|| {
+        format!(
+            "failed to save HTTP 429 timestamp to {}",
+            config_path.display()
+        )
+    })?;
+    eprintln!(
+        "{}",
+        red_bold(&format!(
+            "HTTP 429 rate limit detected. Saved cooldown timestamp to {}. Temporary files were cleaned; exiting. Try again after 10 minutes.",
+            config_path.display()
+        ))
+    );
+    Ok(())
+}
+
+fn rate_limit_cooldown_remaining(last_429_at: f64, now: f64) -> Option<Duration> {
+    if !last_429_at.is_finite() || last_429_at <= 0.0 {
+        return None;
+    }
+
+    let elapsed = now - last_429_at;
+    if elapsed >= RATE_LIMIT_COOLDOWN.as_secs_f64() {
+        return None;
+    }
+
+    let remaining = if elapsed.is_sign_negative() {
+        RATE_LIMIT_COOLDOWN
+    } else {
+        Duration::from_secs_f64(RATE_LIMIT_COOLDOWN.as_secs_f64() - elapsed)
+    };
+    Some(remaining)
+}
+
+fn format_duration(duration: Duration) -> String {
+    let mut seconds = duration.as_secs();
+    if duration.subsec_nanos() > 0 {
+        seconds += 1;
+    }
+
+    let minutes = seconds / 60;
+    let seconds = seconds % 60;
+    if minutes == 0 {
+        format!("{seconds}s")
+    } else {
+        format!("{minutes}m {seconds}s")
+    }
+}
+
+fn current_time_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64())
+        .unwrap_or_default()
 }
 
 async fn download_resource(
@@ -251,7 +330,7 @@ async fn download_tracks_concurrently(
     let completed_tracks = Arc::new(AtomicUsize::new(0));
     let total_tracks = tracks.len();
 
-    let results: Vec<Option<MissingTrack>> = stream::iter(tracks.into_iter().enumerate())
+    let downloads = stream::iter(tracks.into_iter().enumerate())
         .map(|(index, track)| {
             let semaphore = Arc::clone(&semaphore);
             let cover_cache = Arc::clone(&cover_cache);
@@ -262,12 +341,12 @@ async fn download_tracks_concurrently(
                 let _permit = match semaphore.acquire_owned().await {
                     Ok(permit) => permit,
                     Err(err) => {
-                        return Some(MissingTrack::from_track(
+                        return Ok(Some(MissingTrack::from_track(
                             index,
                             total_tracks,
                             &track,
                             format!("failed to acquire download slot: {err}"),
-                        ));
+                        )));
                     }
                 };
                 let delay = track_start_delay(index, concurrency);
@@ -279,6 +358,7 @@ async fn download_tracks_concurrently(
                     );
                     sleep(delay).await;
                 }
+
                 let playlist_position = match numbering {
                     TrackNumbering::Playlist => Some(index + 1),
                     TrackNumbering::Album { .. } => None,
@@ -311,34 +391,43 @@ async fn download_tracks_concurrently(
                 match result {
                     Ok(TrackDownloadStatus::Saved) => {
                         println!("[global {finished}/{total_tracks}] Track complete");
-                        None
+                        Ok(None)
                     }
                     Ok(TrackDownloadStatus::SkippedUnavailable) => {
                         eprintln!("[global {finished}/{total_tracks}] Track skipped");
-                        Some(MissingTrack::from_track(
+                        Ok(Some(MissingTrack::from_track(
                             index,
                             total_tracks,
                             &track,
                             "unavailable for streaming",
-                        ))
+                        )))
                     }
+                    Err(err) if is_rate_limited_error(&err) => Err(err),
                     Err(err) => {
                         eprintln!("[global {finished}/{total_tracks}] Track failed: {err:#}");
-                        Some(MissingTrack::from_track(
+                        Ok(Some(MissingTrack::from_track(
                             index,
                             total_tracks,
                             &track,
                             format!("{err:#}"),
-                        ))
+                        )))
                     }
                 }
             }
         })
-        .buffer_unordered(concurrency)
-        .collect()
-        .await;
+        .buffer_unordered(concurrency);
 
-    let missing_tracks: Vec<_> = results.into_iter().flatten().collect();
+    let mut missing_tracks = Vec::new();
+    futures_util::pin_mut!(downloads);
+    while let Some(result) = downloads.next().await {
+        match result {
+            Ok(Some(missing_track)) => missing_tracks.push(missing_track),
+            Ok(None) => {}
+            Err(err) if is_rate_limited_error(&err) => return Err(err),
+            Err(err) => return Err(err),
+        }
+    }
+
     print_missing_tracks(&missing_tracks);
 
     Ok(())
@@ -462,6 +551,7 @@ async fn download_track_with_retries(
     loop {
         match download_track(client, track, folder, cover_cache, options.clone()).await {
             Ok(status) => return Ok(status),
+            Err(err) if is_rate_limited_error(&err) => return Err(err),
             Err(err) if attempt < TRACK_DOWNLOAD_MAX_ATTEMPTS => {
                 eprintln!(
                     "{} Retrying track after failure (attempt {}/{}): {err:#}",
@@ -586,6 +676,9 @@ async fn download_track(
     )
     .await
     {
+        if is_rate_limited_error(&err) {
+            return Err(err).context("rate limit while writing track metadata");
+        }
         eprintln!(
             "{} Metadata skipped for {}: {err:#}",
             progress_scope.label(),
@@ -751,6 +844,7 @@ async fn write_track_metadata(
     let cover = if let Some(cover_uuid) = metadata.cover_uuid.as_deref() {
         match cover_art_bytes(client, cover_uuid, cover_cache).await {
             Ok(cover) => Some(cover.as_ref().clone()),
+            Err(err) if is_rate_limited_error(&err) => return Err(err),
             Err(err) => {
                 eprintln!(
                     "{} Cover art skipped for {}: {err:#}",
@@ -1029,6 +1123,33 @@ mod tests {
     #[test]
     fn wraps_text_in_bold_red() {
         assert_eq!(red_bold("missing"), "\x1b[1;31mmissing\x1b[0m");
+    }
+
+    #[test]
+    fn rate_limit_cooldown_blocks_recent_429() {
+        assert_eq!(
+            rate_limit_cooldown_remaining(1_000.0, 1_060.0),
+            Some(Duration::from_secs(540))
+        );
+    }
+
+    #[test]
+    fn rate_limit_cooldown_expires_after_ten_minutes() {
+        assert_eq!(rate_limit_cooldown_remaining(1_000.0, 1_600.0), None);
+    }
+
+    #[test]
+    fn rate_limit_cooldown_handles_future_clock_skew() {
+        assert_eq!(
+            rate_limit_cooldown_remaining(1_000.0, 900.0),
+            Some(RATE_LIMIT_COOLDOWN)
+        );
+    }
+
+    #[test]
+    fn formats_cooldown_duration() {
+        assert_eq!(format_duration(Duration::from_secs(9)), "9s");
+        assert_eq!(format_duration(Duration::from_secs(601)), "10m 1s");
     }
 
     #[test]

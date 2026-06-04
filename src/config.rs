@@ -31,6 +31,7 @@ pub struct TidalConfig {
 pub struct DownloadsConfig {
     pub dash_segment_concurrency: usize,
     pub download_dir: Option<PathBuf>,
+    pub last_429_at: f64,
 }
 
 impl Default for TidalConfig {
@@ -50,6 +51,7 @@ impl Default for DownloadsConfig {
         Self {
             dash_segment_concurrency: DEFAULT_DASH_SEGMENT_CONCURRENCY,
             download_dir: None,
+            last_429_at: 0.0,
         }
     }
 }
@@ -192,6 +194,7 @@ mod tests {
         )?;
 
         assert_eq!(config.downloads.dash_segment_concurrency, 4);
+        assert_eq!(config.downloads.last_429_at, 0.0);
         Ok(())
     }
 }

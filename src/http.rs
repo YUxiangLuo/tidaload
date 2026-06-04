@@ -1,3 +1,4 @@
+use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
@@ -24,6 +25,39 @@ pub fn configure_http_client(builder: reqwest::ClientBuilder) -> reqwest::Client
 pub struct ResponseBody<T> {
     pub status: StatusCode,
     pub body: T,
+}
+
+#[derive(Debug, Clone)]
+pub struct RateLimitError {
+    target: String,
+}
+
+impl RateLimitError {
+    fn new(target: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+        }
+    }
+}
+
+impl fmt::Display for RateLimitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.target.is_empty() {
+            write!(formatter, "HTTP 429 Too Many Requests")
+        } else {
+            write!(formatter, "HTTP 429 Too Many Requests for {}", self.target)
+        }
+    }
+}
+
+impl std::error::Error for RateLimitError {}
+
+pub fn rate_limit_error(target: impl Into<String>) -> anyhow::Error {
+    RateLimitError::new(target).into()
+}
+
+pub fn is_rate_limited_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RateLimitError>().is_some()
 }
 
 pub async fn send_text_with_retries(
@@ -89,6 +123,10 @@ where
         };
 
         let status = response.status();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(rate_limit_error(response.url().to_string()));
+        }
+
         if attempt < HTTP_MAX_ATTEMPTS && is_retryable_status(status) {
             eprintln!(
                 "retrying HTTP request after {status} (attempt {})",
@@ -162,5 +200,12 @@ mod tests {
         assert_eq!(retry_delay(1), Duration::from_millis(500));
         assert_eq!(retry_delay(2), Duration::from_secs(1));
         assert_eq!(retry_delay(99), RETRY_MAX_DELAY);
+    }
+
+    #[test]
+    fn detects_rate_limit_error_through_context() {
+        let err = rate_limit_error("https://api.example").context("wrapped");
+
+        assert!(is_rate_limited_error(&err));
     }
 }

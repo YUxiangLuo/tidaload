@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -14,12 +14,33 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 use crate::http::{
-    HTTP_MAX_ATTEMPTS, is_retryable_status, send_bytes_with_retries, sleep_before_retry,
+    HTTP_MAX_ATTEMPTS, is_rate_limited_error, is_retryable_status, rate_limit_error,
+    send_bytes_with_retries, sleep_before_retry,
 };
 
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
 type Aes128Ctr = Ctr64BE<Aes128>;
 const DIRECT_PROGRESS_INTERVAL_BYTES: u64 = 2 * 1024 * 1024;
+
+struct TempPathGuard {
+    paths: Vec<PathBuf>,
+}
+
+impl TempPathGuard {
+    fn new(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            paths: paths.into_iter().collect(),
+        }
+    }
+}
+
+impl Drop for TempPathGuard {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum DownloadProgress {
@@ -57,6 +78,7 @@ pub async fn download_to_file(
     }
 
     let tmp_path = path.with_extension("tidaload.part");
+    let _tmp_guard = TempPathGuard::new([tmp_path.clone()]);
     let result = async {
         download_url_to_tmp(client, url, &tmp_path, progress.as_ref()).await?;
 
@@ -103,6 +125,11 @@ pub async fn download_direct_to_flac_file(
     let source_tmp_path = path.with_extension("tidaload.source.m4a");
     let source_part_path = source_tmp_path.with_extension("tidaload.part");
     let flac_tmp_path = path.with_extension("tidaload.part.flac");
+    let _tmp_guard = TempPathGuard::new([
+        source_tmp_path.clone(),
+        source_part_path.clone(),
+        flac_tmp_path.clone(),
+    ]);
     remove_existing_path(&source_tmp_path).await?;
     remove_existing_path(&source_part_path).await?;
     remove_existing_path(&flac_tmp_path).await?;
@@ -159,6 +186,7 @@ pub async fn download_segmented_to_file(
 
     let fmp4_tmp_path = path.with_extension("tidaload.dash.m4a");
     let flac_tmp_path = path.with_extension("tidaload.part.flac");
+    let _tmp_guard = TempPathGuard::new([fmp4_tmp_path.clone(), flac_tmp_path.clone()]);
     remove_existing_path(&fmp4_tmp_path).await?;
     remove_existing_path(&flac_tmp_path).await?;
 
@@ -278,6 +306,9 @@ async fn download_url_to_tmp(
                 output.flush().await?;
                 return Ok(());
             }
+            Err(DownloadAttemptError::Retryable(err)) if is_rate_limited_error(&err) => {
+                return Err(err);
+            }
             Err(DownloadAttemptError::Retryable(err)) if attempt < HTTP_MAX_ATTEMPTS => {
                 drop(output);
                 eprintln!(
@@ -308,10 +339,14 @@ async fn append_url_once(
         Ok(response) => response,
         Err(err) => return Err(DownloadAttemptError::Retryable(err)),
     };
-    if is_retryable_status(response.status()) {
+    let status = response.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(DownloadAttemptError::Retryable(rate_limit_error(url)));
+    }
+    if is_retryable_status(status) {
         return Err(DownloadAttemptError::Retryable(anyhow!(
             "download request failed for {url}: {}",
-            response.status()
+            status
         )));
     }
     let response = match response
@@ -378,6 +413,9 @@ async fn fetch_url_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>>
     let response = send_bytes_with_retries(client.get(url))
         .await
         .with_context(|| format!("failed to request {url}"))?;
+    if response.status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(rate_limit_error(url));
+    }
     if !response.status.is_success() {
         return Err(anyhow!(
             "download request failed for {url}: {}",
@@ -593,5 +631,27 @@ mod tests {
             dash_segment_url("https://audio.example/$Number$.mp4?token=x", 42),
             "https://audio.example/42.mp4?token=x"
         );
+    }
+
+    #[test]
+    fn temp_path_guard_removes_registered_files_on_drop() -> Result<()> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tidaload-temp-guard-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("track.tidaload.part");
+        std::fs::write(&path, b"partial")?;
+
+        {
+            let _guard = TempPathGuard::new([path.clone()]);
+        }
+
+        assert!(!path.exists());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }
