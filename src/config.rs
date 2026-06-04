@@ -29,7 +29,6 @@ pub struct TidalConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DownloadsConfig {
-    pub concurrency: usize,
     pub dash_segment_concurrency: usize,
     pub download_dir: Option<PathBuf>,
 }
@@ -49,7 +48,6 @@ impl Default for TidalConfig {
 impl Default for DownloadsConfig {
     fn default() -> Self {
         Self {
-            concurrency: DEFAULT_DOWNLOAD_CONCURRENCY,
             dash_segment_concurrency: DEFAULT_DASH_SEGMENT_CONCURRENCY,
             download_dir: None,
         }
@@ -180,6 +178,20 @@ mod tests {
             music_download_dir(Some(Path::new("~/TIDAL")))?,
             home.join("TIDAL")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ignores_legacy_download_concurrency_config() -> Result<()> {
+        let config: Config = toml::from_str(
+            r#"
+            [downloads]
+            concurrency = 99
+            dash_segment_concurrency = 4
+            "#,
+        )?;
+
+        assert_eq!(config.downloads.dash_segment_concurrency, 4);
         Ok(())
     }
 }

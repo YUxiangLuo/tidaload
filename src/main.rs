@@ -57,9 +57,6 @@ struct Cli {
     kind: Option<ResourceKind>,
 
     #[arg(long, global = true)]
-    concurrency: Option<usize>,
-
-    #[arg(long, global = true)]
     dash_segment_concurrency: Option<usize>,
 
     #[arg(long, global = true)]
@@ -98,7 +95,6 @@ async fn main() -> Result<()> {
                 &mut config,
                 &cli.config,
                 cli.kind,
-                cli.concurrency,
                 cli.dash_segment_concurrency,
                 cli.download_dir,
                 items,
@@ -114,19 +110,10 @@ async fn run_download(
     config: &mut Config,
     config_path: &Path,
     kind: Option<ResourceKind>,
-    concurrency: Option<usize>,
     dash_segment_concurrency: Option<usize>,
     download_dir: Option<PathBuf>,
     items: Vec<String>,
 ) -> Result<()> {
-    if let Some(concurrency) = concurrency {
-        config.downloads.concurrency = concurrency.max(1);
-    } else {
-        config.downloads.concurrency = config
-            .downloads
-            .concurrency
-            .clamp(1, DEFAULT_DOWNLOAD_CONCURRENCY);
-    }
     if let Some(dash_segment_concurrency) = dash_segment_concurrency {
         config.downloads.dash_segment_concurrency = dash_segment_concurrency.max(1);
     } else if config.downloads.dash_segment_concurrency == 0 {
@@ -257,7 +244,7 @@ async fn download_tracks_concurrently(
     numbering: TrackNumbering,
     tag_context: TrackTagContext,
 ) -> Result<()> {
-    let concurrency = config.downloads.concurrency.max(1);
+    let concurrency = DEFAULT_DOWNLOAD_CONCURRENCY;
     let dash_segment_concurrency = config.downloads.dash_segment_concurrency.max(1);
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let cover_cache = Arc::new(Mutex::new(HashMap::new()));
@@ -1155,23 +1142,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_direct_download_with_global_concurrency() {
-        let cli = Cli::try_parse_from([
+    fn rejects_track_download_concurrency_argument() {
+        let err = Cli::try_parse_from([
             "tidaload",
             "--concurrency",
             "8",
             "https://tidal.com/playlist/36ea71a8-445e-41a4-82ab-6628c581535d",
         ])
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(cli.concurrency, Some(8));
-        match cli.command {
-            Command::Direct(items) => assert_eq!(
-                items,
-                vec!["https://tidal.com/playlist/36ea71a8-445e-41a4-82ab-6628c581535d"]
-            ),
-            command => panic!("expected direct download command, got {command:?}"),
-        }
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
