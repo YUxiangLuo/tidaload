@@ -623,6 +623,10 @@ pub fn sanitize_file_name(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread::JoinHandle;
+
     use super::*;
 
     #[test]
@@ -653,5 +657,140 @@ mod tests {
         assert!(!path.exists());
         std::fs::remove_dir_all(dir)?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_download_returns_rate_limit_error_for_http_429() -> Result<()> {
+        let server = TestHttpServer::new(vec![TestResponse::new(
+            429,
+            "Too Many Requests",
+            b"limited".to_vec(),
+        )])?;
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let path = unique_temp_path("limited.flac")?;
+
+        let err = download_to_file(&client, &server.url("/track.flac"), &path, None, None)
+            .await
+            .unwrap_err();
+
+        assert!(crate::http::is_rate_limited_error(&err));
+        assert!(!path.exists());
+        assert_eq!(server.join(), vec!["/track.flac"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dash_segment_fetch_retries_transient_server_error() -> Result<()> {
+        let server = TestHttpServer::new(vec![
+            TestResponse::new(503, "Service Unavailable", Vec::new()),
+            TestResponse::new(200, "OK", b"segment".to_vec()),
+        ])?;
+        let client = reqwest::Client::builder().no_proxy().build()?;
+
+        let bytes = fetch_url_bytes(&client, &server.url("/segments/1.m4s")).await?;
+
+        assert_eq!(bytes, b"segment");
+        assert_eq!(server.join(), vec!["/segments/1.m4s", "/segments/1.m4s"]);
+        Ok(())
+    }
+
+    struct TestResponse {
+        status: u16,
+        reason: &'static str,
+        body: Vec<u8>,
+    }
+
+    impl TestResponse {
+        fn new(status: u16, reason: &'static str, body: Vec<u8>) -> Self {
+            Self {
+                status,
+                reason,
+                body,
+            }
+        }
+    }
+
+    struct TestHttpServer {
+        base_url: String,
+        handle: JoinHandle<Vec<String>>,
+    }
+
+    impl TestHttpServer {
+        fn new(responses: Vec<TestResponse>) -> Result<Self> {
+            let listener = TcpListener::bind(("127.0.0.1", 0))?;
+            let addr = listener.local_addr()?;
+            let handle = std::thread::spawn(move || {
+                let mut paths = Vec::new();
+                for response in responses {
+                    let (mut stream, _) = listener.accept().expect("test HTTP accept failed");
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                        .expect("test HTTP timeout failed");
+                    let path = read_request_path(&mut stream);
+                    paths.push(path);
+
+                    let headers = format!(
+                        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response.status,
+                        response.reason,
+                        response.body.len()
+                    );
+                    stream
+                        .write_all(headers.as_bytes())
+                        .expect("test HTTP headers write failed");
+                    stream
+                        .write_all(&response.body)
+                        .expect("test HTTP body write failed");
+                }
+                paths
+            });
+
+            Ok(Self {
+                base_url: format!("http://{addr}"),
+                handle,
+            })
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("{}{}", self.base_url, path)
+        }
+
+        fn join(self) -> Vec<String> {
+            self.handle.join().expect("test HTTP thread panicked")
+        }
+    }
+
+    fn read_request_path(stream: &mut std::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        String::from_utf8_lossy(&request)
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/")
+            .to_string()
+    }
+
+    fn unique_temp_path(name: &str) -> Result<PathBuf> {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        Ok(std::env::temp_dir().join(format!(
+            "tidaload-download-test-{}-{unique}-{name}",
+            std::process::id()
+        )))
     }
 }

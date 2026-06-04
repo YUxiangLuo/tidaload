@@ -17,6 +17,12 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Install Rust components
+      run: rustup component add rustfmt clippy
+    - name: Check formatting
+      run: cargo fmt --check
+    - name: Run Clippy
+      run: cargo clippy --all-targets --all-features --locked -- -D warnings
     - name: Build
       run: cargo build --locked --verbose
     - name: Run tests
